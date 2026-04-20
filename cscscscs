@@ -1,0 +1,3482 @@
+/*
+
+ať to renderování, těch hp aby to ukazovalo fungovalo úplně stejně jako tady v tom co jsem poslal. Zároveň ten mousedelayfix ma fungovat jen v minecraftu a divně mi to pozměnuje dpi to taky oprav. A zaroven u té minimapy udělej aby to neukazovalo npc a načítala se víc clean.
+
+ 
+ * ============================================================================
+ *                         KARVIS FILES v1
+ *                    Legit Minecraft Utility Mod
+ * ============================================================================
+ *
+ * Features:
+ *   - Nick Changer (client-side nickname)
+ *   - No Jump Delay (removes jump cooldown)
+ *   - No Hit Delay (removes attack cooldown)
+ *   - Xaero-style Minimap (terrain, players, caves, ores)
+ *   - Borderless Fullscreen (F11)
+ *
+ * Controls:
+ *   - SHIFT + ALT = Toggle GUI visibility
+ *   - DELETE = Unload mod
+ *   - F11 = Toggle borderless fullscreen
+ *
+ * Minimap controls (from menu):
+ *   - Minimap       = On / Off
+ *   - Corner        = Top-Right / Top-Left / Bottom-Right / Bottom-Left
+ *   - Size          = Small / Medium / Large
+ *   - Shape         = Round / Square
+ *   - Zoom          = 1x / 2x / 3x / 4x
+ *
+ * ============================================================================
+ */
+
+#define NOMINMAX
+#include <Windows.h>
+#include <windowsx.h>
+#include <jni.h>
+#include <jvmti.h>
+#include <string>
+#include <vector>
+#include <cmath>
+#include <algorithm>
+#include <ctime>
+#include <random>
+#include <sstream>
+#include <iomanip>
+#include <cstdint>
+#include <cstdio>
+
+ // Ensure min/max are available even if NOMINMAX is defined by the project
+#ifndef min
+#define min(a,b) (((a) < (b)) ? (a) : (b))
+#endif
+#ifndef max
+#define max(a,b) (((a) > (b)) ? (a) : (b))
+#endif
+#pragma comment(lib, "gdi32.lib")
+#pragma comment(lib, "user32.lib")
+#pragma comment(lib, "msimg32.lib")
+#pragma comment(lib, "winmm.lib")
+
+typedef jint(JNICALL* JNI_GetCreatedJavaVMs_t)(JavaVM**, jsize, jsize*);
+
+// ===================== LOGGING =====================
+static FILE* g_logFile = nullptr;
+static CRITICAL_SECTION g_logCS;
+static bool g_logCSInit = false;
+
+static void LogInit() {
+    if (g_logFile) return;
+    if (!g_logCSInit) { InitializeCriticalSection(&g_logCS); g_logCSInit = true; }
+    char path[MAX_PATH];
+    GetTempPathA(MAX_PATH, path);
+    strcat_s(path, "karvis_debug.log");
+    fopen_s(&g_logFile, path, "w");
+    if (g_logFile) { fprintf(g_logFile, "=== Karvis Files v1 Log Started ===\n"); fflush(g_logFile); }
+}
+
+static void Log(const char* fmt, ...) {
+    if (!g_logCSInit) { InitializeCriticalSection(&g_logCS); g_logCSInit = true; }
+    if (!g_logFile) LogInit();
+    if (!g_logFile) return;
+    EnterCriticalSection(&g_logCS);
+    SYSTEMTIME st; GetLocalTime(&st);
+    fprintf(g_logFile, "[%02d:%02d:%02d.%03d] ", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+    va_list args; va_start(args, fmt);
+    vfprintf(g_logFile, fmt, args);
+    va_end(args);
+    fprintf(g_logFile, "\n");
+    fflush(g_logFile);
+    LeaveCriticalSection(&g_logCS);
+}
+
+// ===================== SETTINGS =====================
+struct Settings {
+    bool noJumpDelay = false;
+    bool noHitDelay = false;
+    bool mouseDelayFix = false; // disables Windows mouse accel / enhance pointer precision
+    bool espShowHP = false; // in-game HP hearts above player heads (projected overlay)
+    char nickname[64] = "";
+
+    // Minimap
+    bool  mapEnabled = true;
+    int   mapCorner = 0;   // 0=TR, 1=TL, 2=BR, 3=BL
+    int   mapSize = 2;   // 0=S,1=M,2=L,3=XL,4=XXL,5=HUGE
+    bool  mapRound = true;
+    int   mapZoom = 2;   // 1..5 zoom levels
+    bool  mapShowEntities = true;
+    bool  mapShowOres = true;
+    bool  mapShowHeads = true;  // render player heads as pixel-art
+    bool  mapShowNames = true;  // show names below heads
+    int   mapOpacity = 230;   // 120..255
+};
+static Settings g_settings;
+
+// GUI tab state
+static int g_currentTab = 0;          // 0=General, 1=Minimap
+static int g_scrollOffset[2] = { 0,0 };   // scroll per tab
+
+// ===================== GLOBALS =====================
+static CRITICAL_SECTION g_dataCS;
+static volatile bool g_dataCSReady = false;
+static void InitDataCS() { if (!g_dataCSReady) { InitializeCriticalSection(&g_dataCS); g_dataCSReady = true; } }
+
+static bool g_inGame = false;
+static volatile bool g_jniRunning = false;
+static HANDLE g_jniThread = nullptr;
+
+// Borderless fullscreen
+static HHOOK g_keyboardHook = nullptr;
+static bool g_borderlessFS = false;
+static DWORD g_savedGameStyle = 0;
+static RECT g_savedGameRect = {};
+static volatile bool g_f11Pressed = false;
+
+// Nick changer
+static char g_pendingNick[64] = "";
+static volatile bool g_nickApplyPending = false;
+static HWND g_nickDialogWnd = nullptr;
+static HWND g_nickEditCtrl = nullptr;
+static HWND g_nickStatusLabel = nullptr;
+
+// GUI
+static HWND g_hWnd = nullptr;
+static char g_debugStatus[256] = "Initializing...";
+
+// Mouse hook
+static HHOOK g_mouseHook = nullptr;
+static DWORD g_mouseHookThreadId = 0;
+static HANDLE g_mouseHookThreadHandle = nullptr;
+
+// Minimap overlay
+static HWND  g_mapWnd = nullptr;
+static DWORD g_mapThreadId = 0;
+static HANDLE g_mapThreadHandle = nullptr;
+static volatile bool g_mapRunning = false;
+
+// ESP overlay (in-game HP above heads, projected)
+static HWND  g_espWnd = nullptr;
+static DWORD g_espThreadId = 0;
+static HANDLE g_espThreadHandle = nullptr;
+static volatile bool g_espRunning = false;
+
+// ===================== MINIMAP DATA =====================
+// terrain grid: TERRAIN_DIM x TERRAIN_DIM samples centered on player
+static const int TERRAIN_DIM = 128;
+static CRITICAL_SECTION g_mapCS;
+static volatile bool g_mapCSReady = false;
+static void InitMapCS() { if (!g_mapCSReady) { InitializeCriticalSection(&g_mapCS); g_mapCSReady = true; } }
+
+struct MapSample {
+    COLORREF color;   // surface color
+    int      yTop;    // surface height
+    uint8_t  flags;   // 1=ore(highlighted), 2=cave, 4=water, 8=player-level
+};
+
+struct MapEntity {
+    float x, y, z;        // world coords
+    float yaw;            // rotationYaw
+    int   kind;           // 0=self,1=player,2=hostile,3=passive,4=item
+    char  name[32];       // display name
+    COLORREF headColor;   // derived from name hash
+    bool  isSelf = false;       // local player - never rendered
+    bool  isRealPlayer = false; // only true for entries in World.playerEntities
+    bool  hasHelmet = false;    // armor slot 3 non-empty (visual overlay)
+    float health = 0.f;         // 0..maxHealth
+    float maxHealth = 0.f;
+    float absorption = 0.f;     // extra "golden heart" hp
+};
+
+struct MapData {
+    MapSample samples[TERRAIN_DIM * TERRAIN_DIM];
+    int    centerBlockX = 0;
+    int    centerBlockZ = 0;
+    float  playerX = 0, playerY = 64, playerZ = 0;
+    float  playerYaw = 0;
+    bool   underground = false;
+    std::vector<MapEntity> entities;
+    bool   valid = false;
+    ULONGLONG lastUpdate = 0;
+};
+static MapData g_map;
+
+// ===================== HOOKS =====================
+LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
+    return CallNextHookEx(g_mouseHook, nCode, wParam, lParam);
+}
+
+LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
+    if (nCode >= 0) {
+        KBDLLHOOKSTRUCT* kb = (KBDLLHOOKSTRUCT*)lParam;
+        if (kb->vkCode == VK_F11 && (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN)) {
+            if (!(kb->flags & LLKHF_INJECTED)) {
+                g_f11Pressed = true;
+                return 1;
+            }
+        }
+    }
+    return CallNextHookEx(g_keyboardHook, nCode, wParam, lParam);
+}
+
+// ===================== BORDERLESS FULLSCREEN =====================
+static HWND FindGameWindow() {
+    HWND hw = FindWindowA("LWJGL", nullptr);
+    if (!hw) hw = FindWindowA("GLFW30", nullptr);
+    if (!hw) hw = FindWindowA(nullptr, "Minecraft");
+    if (!hw) hw = FindWindowA("SunAwtFrame", nullptr);
+    return hw;
+}
+
+static void ToggleBorderlessFullscreen(HWND game) {
+    if (!game) return;
+    HMONITOR hMon = MonitorFromWindow(game, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi = { sizeof(MONITORINFO) };
+    GetMonitorInfo(hMon, &mi);
+    if (!g_borderlessFS) {
+        g_savedGameStyle = (DWORD)GetWindowLongA(game, GWL_STYLE);
+        GetWindowRect(game, &g_savedGameRect);
+        DWORD ns = g_savedGameStyle & ~(WS_CAPTION | WS_THICKFRAME | WS_BORDER |
+            WS_DLGFRAME | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX);
+        SetWindowLongA(game, GWL_STYLE, (LONG)ns);
+        SetWindowPos(game, HWND_TOP,
+            mi.rcMonitor.left, mi.rcMonitor.top,
+            mi.rcMonitor.right - mi.rcMonitor.left,
+            mi.rcMonitor.bottom - mi.rcMonitor.top,
+            SWP_FRAMECHANGED | SWP_NOACTIVATE);
+        g_borderlessFS = true;
+        Log("Borderless fullscreen ON");
+    }
+    else {
+        SetWindowLongA(game, GWL_STYLE, (LONG)g_savedGameStyle);
+        SetWindowPos(game, HWND_TOP,
+            g_savedGameRect.left, g_savedGameRect.top,
+            g_savedGameRect.right - g_savedGameRect.left,
+            g_savedGameRect.bottom - g_savedGameRect.top,
+            SWP_FRAMECHANGED | SWP_NOACTIVATE);
+        g_borderlessFS = false;
+        Log("Borderless fullscreen OFF");
+    }
+}
+
+// ===================== JNI HELPERS =====================
+static jfieldID TryGetField(JNIEnv* env, jclass cls, const char** names, const char* sig) {
+    if (!env || !cls) return nullptr;
+    for (int i = 0; names[i]; i++) {
+        jfieldID f = env->GetFieldID(cls, names[i], sig);
+        if (f && !env->ExceptionCheck()) return f;
+        env->ExceptionClear();
+    }
+    return nullptr;
+}
+
+static jmethodID TryGetMethod(JNIEnv* env, jclass cls, const char** names, const char* sig) {
+    if (!env || !cls) return nullptr;
+    for (int i = 0; names[i]; i++) {
+        jmethodID m = env->GetMethodID(cls, names[i], sig);
+        if (m && !env->ExceptionCheck()) return m;
+        env->ExceptionClear();
+    }
+    return nullptr;
+}
+
+// ===================== JAVA CLASS =====================
+class Java {
+public:
+    static JavaVM* jvm;
+    static JNIEnv* env;
+    static jvmtiEnv* jvmti;
+    static bool attached;
+    static jobject cachedClassLoader;
+
+    // Core
+    static jclass mcClass;
+    static jmethodID getMinecraftMethod;
+    static jfieldID field_thePlayer, field_theWorld, field_currentScreen;
+    static jfieldID field_jumpTicks, field_leftClickCounter;
+    static jclass entityLivingClass;
+
+    // Session for nickname
+    static jfieldID field_session;
+    static jclass sessionClass;
+    static jfieldID field_sessionUsername;
+
+    // Entity introspection
+    static jclass entityClass;
+    static jfieldID field_posX, field_posY, field_posZ;
+    static jfieldID field_rotationYaw;
+    static jfieldID field_rotationPitch;
+    static jmethodID method_getName;          // Entity.getName()
+    static jmethodID method_getCommandSenderName;
+
+    // EntityLivingBase HP / absorption
+    static jmethodID method_getHealth;        // EntityLivingBase.getHealth() -> F
+    static jmethodID method_getMaxHealth;     // EntityLivingBase.getMaxHealth() -> F
+    static jmethodID method_getAbsorption;    // EntityLivingBase.getAbsorptionAmount() -> F
+
+    // Player inventory / helmet
+    static jclass    playerClass;             // net/minecraft/entity/player/EntityPlayer
+    static jfieldID  field_playerInventory;   // EntityPlayer.inventory -> InventoryPlayer
+    static jclass    invPlayerClass;          // net/minecraft/entity/player/InventoryPlayer
+    static jfieldID  field_armorInventory;    // InventoryPlayer.armorInventory -> [Lnet/.../ItemStack;
+
+    // World/Chunk/Block for minimap
+    static jclass worldClass;
+    static jclass blockPosClass;
+    static jmethodID blockPosCtor;            // (III)V
+    static jmethodID method_getBlockState;    // World.getBlockState(BlockPos) -> IBlockState
+    static jmethodID method_getHeightXZ;      // Chunk.getHeightValue(int,int) -> int (may be null)
+    static jfieldID field_loadedEntityList;   // World.loadedEntityList
+    static jfieldID field_playerEntities;     // World.playerEntities
+
+    static jclass iBlockStateClass;
+    static jmethodID method_ibs_getBlock;     // IBlockState.getBlock() -> Block
+    static jclass blockClass;
+    static jmethodID method_block_getMapColor;// Block.getMapColor(IBlockState) -> MapColor
+    static jmethodID method_block_getUnlocalizedName; // Block.getUnlocalizedName() -> String
+    static jclass mapColorClass;
+    static jfieldID field_mapColor_value;     // MapColor.colorValue : I
+
+    // List
+    static jclass listClass;
+    static jmethodID method_list_size;
+    static jmethodID method_list_get;
+
+    // String
+    static jclass stringClass;
+
+    static std::string mcClassName;
+    static bool cacheInitialized;
+
+    static bool Initialize();
+    static void Cleanup();
+    static bool FindClassLoader();
+    static bool InitCache();
+    static jclass FindClass(const char* name);
+    static jmethodID GetMethodID(jclass c, const char* n, const char* s);
+    static jmethodID GetStaticMethodID(jclass c, const char* n, const char* s);
+    static jfieldID GetFieldID(jclass c, const char* n, const char* s);
+    static jobject GetMinecraft();
+    static jobject GetPlayer();
+    static jobject GetWorld();
+    static bool IsInWorld();
+    static void ApplyNoJumpDelay();
+    static void ApplyNoHitDelay();
+    static bool SetNickname(const std::string& nick);
+
+    // Minecraft data for minimap
+    static bool GetPlayerPose(float& x, float& y, float& z, float& yaw);
+    static bool GetPlayerPoseEx(float& x, float& y, float& z, float& yaw, float& pitch);
+    static int  GetBlockColorAt(int bx, int by, int bz, uint8_t& flagsOut); // returns RGB or -1
+    static void EnumerateEntities(std::vector<MapEntity>& out, float selfX, float selfZ);
+};
+
+// Static member definitions
+JavaVM* Java::jvm = nullptr;
+JNIEnv* Java::env = nullptr;
+jvmtiEnv* Java::jvmti = nullptr;
+bool Java::attached = false;
+jobject Java::cachedClassLoader = nullptr;
+
+jclass Java::mcClass = nullptr;
+jmethodID Java::getMinecraftMethod = nullptr;
+jfieldID Java::field_thePlayer = nullptr;
+jfieldID Java::field_theWorld = nullptr;
+jfieldID Java::field_currentScreen = nullptr;
+jfieldID Java::field_jumpTicks = nullptr;
+jfieldID Java::field_leftClickCounter = nullptr;
+jclass Java::entityLivingClass = nullptr;
+
+jfieldID Java::field_session = nullptr;
+jclass Java::sessionClass = nullptr;
+jfieldID Java::field_sessionUsername = nullptr;
+
+jclass Java::entityClass = nullptr;
+jfieldID Java::field_posX = nullptr;
+jfieldID Java::field_posY = nullptr;
+jfieldID Java::field_posZ = nullptr;
+jfieldID Java::field_rotationYaw = nullptr;
+jfieldID Java::field_rotationPitch = nullptr;
+jmethodID Java::method_getName = nullptr;
+jmethodID Java::method_getCommandSenderName = nullptr;
+
+jmethodID Java::method_getHealth = nullptr;
+jmethodID Java::method_getMaxHealth = nullptr;
+jmethodID Java::method_getAbsorption = nullptr;
+jclass    Java::playerClass = nullptr;
+jfieldID  Java::field_playerInventory = nullptr;
+jclass    Java::invPlayerClass = nullptr;
+jfieldID  Java::field_armorInventory = nullptr;
+
+jclass Java::worldClass = nullptr;
+jclass Java::blockPosClass = nullptr;
+jmethodID Java::blockPosCtor = nullptr;
+jmethodID Java::method_getBlockState = nullptr;
+jmethodID Java::method_getHeightXZ = nullptr;
+jfieldID Java::field_loadedEntityList = nullptr;
+jfieldID Java::field_playerEntities = nullptr;
+
+jclass Java::iBlockStateClass = nullptr;
+jmethodID Java::method_ibs_getBlock = nullptr;
+jclass Java::blockClass = nullptr;
+jmethodID Java::method_block_getMapColor = nullptr;
+jmethodID Java::method_block_getUnlocalizedName = nullptr;
+jclass Java::mapColorClass = nullptr;
+jfieldID Java::field_mapColor_value = nullptr;
+
+jclass Java::listClass = nullptr;
+jmethodID Java::method_list_size = nullptr;
+jmethodID Java::method_list_get = nullptr;
+
+jclass Java::stringClass = nullptr;
+
+std::string Java::mcClassName;
+bool Java::cacheInitialized = false;
+
+bool Java::Initialize() {
+    Log("=== Java::Initialize ===");
+    HMODULE jvmDll = nullptr;
+    for (int i = 0; i < 60; i++) {
+        jvmDll = GetModuleHandleA("jvm.dll");
+        if (jvmDll) break;
+        Sleep(1000);
+    }
+    if (!jvmDll) { Log("ERROR: jvm.dll not found"); return false; }
+
+    auto fn = (JNI_GetCreatedJavaVMs_t)GetProcAddress(jvmDll, "JNI_GetCreatedJavaVMs");
+    if (!fn) return false;
+
+    jsize cnt = 0;
+    if (fn(&jvm, 1, &cnt) != JNI_OK || cnt == 0) return false;
+    if (jvm->AttachCurrentThread((void**)&env, nullptr) != JNI_OK) return false;
+    attached = true;
+
+    jvm->GetEnv((void**)&jvmti, JVMTI_VERSION_1_2);
+    if (!jvmti) return false;
+
+    if (!FindClassLoader()) return false;
+    return InitCache();
+}
+
+bool Java::FindClassLoader() {
+    if (!env || !jvmti) return false;
+    jint classCount = 0;
+    jclass* classes = nullptr;
+    if (jvmti->GetLoadedClasses(&classCount, &classes) != JVMTI_ERROR_NONE) return false;
+
+    bool found = false;
+    for (int i = 0; i < classCount; i++) {
+        if (!found) {
+            char* sig = nullptr;
+            jvmti->GetClassSignature(classes[i], &sig, nullptr);
+            if (sig) {
+                std::string s(sig);
+                jvmti->Deallocate((unsigned char*)sig);
+                if (s == "Lnet/minecraft/client/Minecraft;" || s == "Lave;") {
+                    jclass cc = env->GetObjectClass(classes[i]);
+                    if (cc) {
+                        jmethodID getCL = env->GetMethodID(cc, "getClassLoader", "()Ljava/lang/ClassLoader;");
+                        if (env->ExceptionCheck()) env->ExceptionClear();
+                        if (getCL) {
+                            jobject cl = env->CallObjectMethod(classes[i], getCL);
+                            if (env->ExceptionCheck()) env->ExceptionClear();
+                            if (cl) {
+                                cachedClassLoader = env->NewGlobalRef(cl);
+                                env->DeleteLocalRef(cl);
+                                found = true;
+                            }
+                        }
+                        env->DeleteLocalRef(cc);
+                    }
+                }
+            }
+        }
+        env->DeleteLocalRef(classes[i]);
+    }
+    jvmti->Deallocate((unsigned char*)classes);
+    return found;
+}
+
+jclass Java::FindClass(const char* name) {
+    if (!env) return nullptr;
+    jclass result = env->FindClass(name);
+    if (result && !env->ExceptionCheck()) return result;
+    env->ExceptionClear();
+
+    if (cachedClassLoader) {
+        std::string cn(name);
+        for (auto& c : cn) if (c == '/') c = '.';
+        jclass cc = env->GetObjectClass(cachedClassLoader);
+        if (!cc) return nullptr;
+        jmethodID lc = env->GetMethodID(cc, "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;");
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        if (lc) {
+            jstring jn = env->NewStringUTF(cn.c_str());
+            if (jn) {
+                result = (jclass)env->CallObjectMethod(cachedClassLoader, lc, jn);
+                env->DeleteLocalRef(jn);
+                if (result && !env->ExceptionCheck()) {
+                    env->DeleteLocalRef(cc);
+                    return result;
+                }
+                env->ExceptionClear();
+                if (result) { env->DeleteLocalRef(result); result = nullptr; }
+            }
+        }
+        env->DeleteLocalRef(cc);
+    }
+    return nullptr;
+}
+
+jmethodID Java::GetMethodID(jclass c, const char* n, const char* s) {
+    if (!env || !c) return nullptr;
+    jmethodID m = env->GetMethodID(c, n, s);
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    return m;
+}
+
+jmethodID Java::GetStaticMethodID(jclass c, const char* n, const char* s) {
+    if (!env || !c) return nullptr;
+    jmethodID m = env->GetStaticMethodID(c, n, s);
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    return m;
+}
+
+jfieldID Java::GetFieldID(jclass c, const char* n, const char* s) {
+    if (!env || !c) return nullptr;
+    jfieldID f = env->GetFieldID(c, n, s);
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    return f;
+}
+
+bool Java::InitCache() {
+    if (cacheInitialized) return true;
+    Log("=== InitCache ===");
+
+    mcClass = (jclass)env->NewGlobalRef(FindClass("net/minecraft/client/Minecraft"));
+    if (!mcClass) { Log("ERROR: MC class not found"); return false; }
+    mcClassName = "net/minecraft/client/Minecraft";
+
+    getMinecraftMethod = GetStaticMethodID(mcClass, "getMinecraft", "()Lnet/minecraft/client/Minecraft;");
+
+    // EntityLivingBase for jump delay + HP / absorption
+    jclass elTemp = FindClass("net/minecraft/entity/EntityLivingBase");
+    if (elTemp) {
+        entityLivingClass = (jclass)env->NewGlobalRef(elTemp);
+        env->DeleteLocalRef(elTemp);
+        field_jumpTicks = GetFieldID(entityLivingClass, "jumpTicks", "I");
+
+        const char* ghN[] = { "getHealth", "func_110143_aJ", nullptr };
+        method_getHealth = TryGetMethod(env, entityLivingClass, ghN, "()F");
+        const char* gmhN[] = { "getMaxHealth", "func_110138_aP", nullptr };
+        method_getMaxHealth = TryGetMethod(env, entityLivingClass, gmhN, "()F");
+        const char* gaN[] = { "getAbsorptionAmount", "func_110139_bj", nullptr };
+        method_getAbsorption = TryGetMethod(env, entityLivingClass, gaN, "()F");
+    }
+
+    // EntityPlayer + InventoryPlayer for helmet detection
+    jclass epTemp = FindClass("net/minecraft/entity/player/EntityPlayer");
+    if (epTemp) {
+        playerClass = (jclass)env->NewGlobalRef(epTemp);
+        env->DeleteLocalRef(epTemp);
+        const char* invN[] = { "inventory", "field_71071_by", nullptr };
+        field_playerInventory = TryGetField(env, playerClass, invN,
+            "Lnet/minecraft/entity/player/InventoryPlayer;");
+    }
+    jclass ipTemp = FindClass("net/minecraft/entity/player/InventoryPlayer");
+    if (ipTemp) {
+        invPlayerClass = (jclass)env->NewGlobalRef(ipTemp);
+        env->DeleteLocalRef(ipTemp);
+        const char* armN[] = { "armorInventory", "field_70460_b", nullptr };
+        field_armorInventory = TryGetField(env, invPlayerClass, armN,
+            "[Lnet/minecraft/item/ItemStack;");
+    }
+
+    // Minecraft fields
+    field_thePlayer = GetFieldID(mcClass, "thePlayer", "Lnet/minecraft/client/entity/EntityPlayerSP;");
+    field_theWorld = GetFieldID(mcClass, "theWorld", "Lnet/minecraft/client/multiplayer/WorldClient;");
+    field_currentScreen = GetFieldID(mcClass, "currentScreen", "Lnet/minecraft/client/gui/GuiScreen;");
+    field_leftClickCounter = GetFieldID(mcClass, "leftClickCounter", "I");
+
+    // Session for nickname
+    const char* sessN[] = { "session", "field_71449_j", nullptr };
+    field_session = TryGetField(env, mcClass, sessN, "Lnet/minecraft/util/Session;");
+
+    if (field_session) {
+        jobject mc2 = GetMinecraft();
+        if (mc2) {
+            jobject sess = env->GetObjectField(mc2, field_session);
+            if (sess) {
+                jclass sc = env->GetObjectClass(sess);
+                if (sc) {
+                    sessionClass = (jclass)env->NewGlobalRef(sc);
+                    const char* unN[] = { "username", "field_74286_b", nullptr };
+                    field_sessionUsername = TryGetField(env, sc, unN, "Ljava/lang/String;");
+                    env->DeleteLocalRef(sc);
+                }
+                env->DeleteLocalRef(sess);
+            }
+            env->DeleteLocalRef(mc2);
+        }
+    }
+
+    // Entity class
+    jclass eT = FindClass("net/minecraft/entity/Entity");
+    if (eT) {
+        entityClass = (jclass)env->NewGlobalRef(eT);
+        env->DeleteLocalRef(eT);
+        field_posX = GetFieldID(entityClass, "posX", "D");
+        field_posY = GetFieldID(entityClass, "posY", "D");
+        field_posZ = GetFieldID(entityClass, "posZ", "D");
+        field_rotationYaw = GetFieldID(entityClass, "rotationYaw", "F");
+        field_rotationPitch = GetFieldID(entityClass, "rotationPitch", "F");
+        const char* gnN[] = { "getName", "func_70005_c_", nullptr };
+        method_getName = TryGetMethod(env, entityClass, gnN, "()Ljava/lang/String;");
+        const char* cnN[] = { "getCommandSenderName", "func_70005_c_", nullptr };
+        method_getCommandSenderName = TryGetMethod(env, entityClass, cnN, "()Ljava/lang/String;");
+    }
+
+    // World / BlockPos / BlockState / Block / MapColor
+    jclass wT = FindClass("net/minecraft/world/World");
+    if (wT) {
+        worldClass = (jclass)env->NewGlobalRef(wT);
+        env->DeleteLocalRef(wT);
+        const char* gbsN[] = { "getBlockState", "func_180495_p", nullptr };
+        method_getBlockState = TryGetMethod(env, worldClass, gbsN,
+            "(Lnet/minecraft/util/BlockPos;)Lnet/minecraft/block/state/IBlockState;");
+        const char* leN[] = { "loadedEntityList", "field_72996_f", nullptr };
+        field_loadedEntityList = TryGetField(env, worldClass, leN, "Ljava/util/List;");
+        const char* peN[] = { "playerEntities", "field_73010_i", nullptr };
+        field_playerEntities = TryGetField(env, worldClass, peN, "Ljava/util/List;");
+    }
+
+    jclass bpT = FindClass("net/minecraft/util/BlockPos");
+    if (bpT) {
+        blockPosClass = (jclass)env->NewGlobalRef(bpT);
+        env->DeleteLocalRef(bpT);
+        blockPosCtor = GetMethodID(blockPosClass, "<init>", "(III)V");
+    }
+
+    jclass ibsT = FindClass("net/minecraft/block/state/IBlockState");
+    if (ibsT) {
+        iBlockStateClass = (jclass)env->NewGlobalRef(ibsT);
+        env->DeleteLocalRef(ibsT);
+        const char* gbN[] = { "getBlock", "func_177230_c", nullptr };
+        method_ibs_getBlock = TryGetMethod(env, iBlockStateClass, gbN,
+            "()Lnet/minecraft/block/Block;");
+    }
+
+    jclass bT = FindClass("net/minecraft/block/Block");
+    if (bT) {
+        blockClass = (jclass)env->NewGlobalRef(bT);
+        env->DeleteLocalRef(bT);
+        const char* mcnN[] = { "getMapColor", "func_180659_g", nullptr };
+        method_block_getMapColor = TryGetMethod(env, blockClass, mcnN,
+            "(Lnet/minecraft/block/state/IBlockState;)Lnet/minecraft/block/material/MapColor;");
+        const char* uN[] = { "getUnlocalizedName", "func_149739_a", nullptr };
+        method_block_getUnlocalizedName = TryGetMethod(env, blockClass, uN, "()Ljava/lang/String;");
+    }
+
+    jclass mcT = FindClass("net/minecraft/block/material/MapColor");
+    if (mcT) {
+        mapColorClass = (jclass)env->NewGlobalRef(mcT);
+        env->DeleteLocalRef(mcT);
+        const char* cvN[] = { "colorValue", "field_76291_p", nullptr };
+        field_mapColor_value = TryGetField(env, mapColorClass, cvN, "I");
+    }
+
+    // List
+    jclass lT = env->FindClass("java/util/List");
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    if (lT) {
+        listClass = (jclass)env->NewGlobalRef(lT);
+        env->DeleteLocalRef(lT);
+        method_list_size = GetMethodID(listClass, "size", "()I");
+        method_list_get = GetMethodID(listClass, "get", "(I)Ljava/lang/Object;");
+    }
+
+    jclass sT = env->FindClass("java/lang/String");
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    if (sT) { stringClass = (jclass)env->NewGlobalRef(sT); env->DeleteLocalRef(sT); }
+
+    cacheInitialized = true;
+    Log("InitCache complete (mapSupport=%s, entitySupport=%s)",
+        (method_getBlockState && blockPosCtor ? "YES" : "NO"),
+        (field_loadedEntityList && field_posX ? "YES" : "NO"));
+    return true;
+}
+
+void Java::Cleanup() {
+    if (env) {
+        if (mcClass) { env->DeleteGlobalRef(mcClass); mcClass = nullptr; }
+        if (entityLivingClass) { env->DeleteGlobalRef(entityLivingClass); entityLivingClass = nullptr; }
+        if (sessionClass) { env->DeleteGlobalRef(sessionClass); sessionClass = nullptr; }
+        if (entityClass) { env->DeleteGlobalRef(entityClass); entityClass = nullptr; }
+        if (worldClass) { env->DeleteGlobalRef(worldClass); worldClass = nullptr; }
+        if (blockPosClass) { env->DeleteGlobalRef(blockPosClass); blockPosClass = nullptr; }
+        if (iBlockStateClass) { env->DeleteGlobalRef(iBlockStateClass); iBlockStateClass = nullptr; }
+        if (blockClass) { env->DeleteGlobalRef(blockClass); blockClass = nullptr; }
+        if (mapColorClass) { env->DeleteGlobalRef(mapColorClass); mapColorClass = nullptr; }
+        if (listClass) { env->DeleteGlobalRef(listClass); listClass = nullptr; }
+        if (stringClass) { env->DeleteGlobalRef(stringClass); stringClass = nullptr; }
+        if (cachedClassLoader) { env->DeleteGlobalRef(cachedClassLoader); cachedClassLoader = nullptr; }
+    }
+    if (jvm && attached) {
+        jvm->DetachCurrentThread();
+        attached = false;
+    }
+    env = nullptr;
+    jvmti = nullptr;
+    cacheInitialized = false;
+}
+
+jobject Java::GetMinecraft() {
+    if (!env || !mcClass || !getMinecraftMethod) return nullptr;
+    jobject mc = env->CallStaticObjectMethod(mcClass, getMinecraftMethod);
+    if (env->ExceptionCheck()) { env->ExceptionClear(); return nullptr; }
+    return mc;
+}
+
+jobject Java::GetPlayer() {
+    jobject mc = GetMinecraft();
+    if (!mc || !field_thePlayer) { if (mc) env->DeleteLocalRef(mc); return nullptr; }
+    jobject p = env->GetObjectField(mc, field_thePlayer);
+    env->DeleteLocalRef(mc);
+    return p;
+}
+
+jobject Java::GetWorld() {
+    jobject mc = GetMinecraft();
+    if (!mc || !field_theWorld) { if (mc) env->DeleteLocalRef(mc); return nullptr; }
+    jobject w = env->GetObjectField(mc, field_theWorld);
+    env->DeleteLocalRef(mc);
+    return w;
+}
+
+bool Java::IsInWorld() {
+    jobject mc = GetMinecraft();
+    if (!mc) return false;
+    jobject pl = field_thePlayer ? env->GetObjectField(mc, field_thePlayer) : nullptr;
+    jobject wl = field_theWorld ? env->GetObjectField(mc, field_theWorld) : nullptr;
+    bool ig = (pl && wl);
+    if (pl) env->DeleteLocalRef(pl);
+    if (wl) env->DeleteLocalRef(wl);
+    env->DeleteLocalRef(mc);
+    return ig;
+}
+
+void Java::ApplyNoJumpDelay() {
+    if (!env || !field_jumpTicks) return;
+    jobject player = GetPlayer();
+    if (!player) return;
+    env->SetIntField(player, field_jumpTicks, 0);
+    env->DeleteLocalRef(player);
+}
+
+void Java::ApplyNoHitDelay() {
+    if (!env || !field_leftClickCounter) return;
+    jobject mc = GetMinecraft();
+    if (!mc) return;
+    env->SetIntField(mc, field_leftClickCounter, 0);
+    env->DeleteLocalRef(mc);
+}
+
+bool Java::SetNickname(const std::string& nick) {
+    if (!env || !field_session || !field_sessionUsername) return false;
+    jobject mc = GetMinecraft();
+    if (!mc) return false;
+    jobject sess = env->GetObjectField(mc, field_session);
+    env->DeleteLocalRef(mc);
+    if (!sess) return false;
+
+    jstring newName = env->NewStringUTF(nick.c_str());
+    if (!newName) { env->DeleteLocalRef(sess); return false; }
+    env->SetObjectField(sess, field_sessionUsername, newName);
+    env->DeleteLocalRef(newName);
+    env->DeleteLocalRef(sess);
+    Log("Nickname set to: %s", nick.c_str());
+    return true;
+}
+
+bool Java::GetPlayerPose(float& x, float& y, float& z, float& yaw) {
+    if (!env || !field_posX) return false;
+    jobject p = GetPlayer();
+    if (!p) return false;
+    x = (float)env->GetDoubleField(p, field_posX);
+    y = (float)env->GetDoubleField(p, field_posY);
+    z = (float)env->GetDoubleField(p, field_posZ);
+    yaw = env->GetFloatField(p, field_rotationYaw);
+    env->DeleteLocalRef(p);
+    return true;
+}
+
+bool Java::GetPlayerPoseEx(float& x, float& y, float& z, float& yaw, float& pitch) {
+    if (!env || !field_posX) return false;
+    jobject p = GetPlayer();
+    if (!p) return false;
+    x = (float)env->GetDoubleField(p, field_posX);
+    y = (float)env->GetDoubleField(p, field_posY);
+    z = (float)env->GetDoubleField(p, field_posZ);
+    yaw = env->GetFloatField(p, field_rotationYaw);
+    pitch = field_rotationPitch ? env->GetFloatField(p, field_rotationPitch) : 0.f;
+    env->DeleteLocalRef(p);
+    return true;
+}
+
+// Fallback color from unlocalized name substring
+static COLORREF FallbackColorFromName(const char* n, uint8_t& flags) {
+    flags = 0;
+    if (!n) return RGB(120, 120, 120);
+    std::string s(n);
+    for (auto& c : s) c = (char)tolower((unsigned char)c);
+
+    if (s.find("diamond") != std::string::npos) { flags |= 1; return RGB(90, 230, 220); }
+    if (s.find("emerald") != std::string::npos) { flags |= 1; return RGB(60, 220, 80); }
+    if (s.find("gold") != std::string::npos) { flags |= 1; return RGB(255, 215, 80); }
+    if (s.find("iron") != std::string::npos) { flags |= 1; return RGB(200, 180, 160); }
+    if (s.find("lapis") != std::string::npos) { flags |= 1; return RGB(60, 90, 200); }
+    if (s.find("redstone") != std::string::npos) { flags |= 1; return RGB(220, 40, 40); }
+    if (s.find("coal") != std::string::npos) { flags |= 1; return RGB(40, 40, 48); }
+    if (s.find("quartz") != std::string::npos) { flags |= 1; return RGB(235, 230, 220); }
+
+    if (s.find("water") != std::string::npos) { flags |= 4; return RGB(50, 80, 200); }
+    if (s.find("lava") != std::string::npos) { return RGB(240, 120, 30); }
+    if (s.find("grass") != std::string::npos) return RGB(90, 170, 60);
+    if (s.find("leaves") != std::string::npos) return RGB(50, 130, 50);
+    if (s.find("log") != std::string::npos || s.find("wood") != std::string::npos) return RGB(110, 80, 45);
+    if (s.find("sand") != std::string::npos) return RGB(220, 210, 150);
+    if (s.find("gravel") != std::string::npos) return RGB(140, 130, 120);
+    if (s.find("dirt") != std::string::npos) return RGB(120, 85, 55);
+    if (s.find("stone") != std::string::npos) return RGB(110, 110, 115);
+    if (s.find("snow") != std::string::npos || s.find("ice") != std::string::npos) return RGB(235, 240, 250);
+    if (s.find("air") != std::string::npos) return RGB(0, 0, 0);
+    return RGB(130, 130, 140);
+}
+
+int Java::GetBlockColorAt(int bx, int by, int bz, uint8_t& flagsOut) {
+    flagsOut = 0;
+    if (!env || !worldClass || !blockPosClass || !method_getBlockState ||
+        !method_ibs_getBlock || !blockPosCtor) return -1;
+
+    jobject mc = GetMinecraft();
+    if (!mc) return -1;
+    jobject world = env->GetObjectField(mc, field_theWorld);
+    env->DeleteLocalRef(mc);
+    if (!world) return -1;
+
+    jobject bp = env->NewObject(blockPosClass, blockPosCtor, bx, by, bz);
+    if (env->ExceptionCheck()) { env->ExceptionClear(); env->DeleteLocalRef(world); return -1; }
+    if (!bp) { env->DeleteLocalRef(world); return -1; }
+
+    jobject state = env->CallObjectMethod(world, method_getBlockState, bp);
+    if (env->ExceptionCheck()) { env->ExceptionClear(); env->DeleteLocalRef(bp); env->DeleteLocalRef(world); return -1; }
+    env->DeleteLocalRef(bp);
+    env->DeleteLocalRef(world);
+    if (!state) return -1;
+
+    jobject block = env->CallObjectMethod(state, method_ibs_getBlock);
+    if (env->ExceptionCheck()) { env->ExceptionClear(); env->DeleteLocalRef(state); return -1; }
+    if (!block) { env->DeleteLocalRef(state); return -1; }
+
+    int color = -1;
+    bool haveColor = false;
+
+    // Try MapColor first
+    if (method_block_getMapColor && field_mapColor_value) {
+        jobject mc2 = env->CallObjectMethod(block, method_block_getMapColor, state);
+        if (env->ExceptionCheck()) { env->ExceptionClear(); }
+        else if (mc2) {
+            jint cv = env->GetIntField(mc2, field_mapColor_value);
+            color = (int)cv & 0xFFFFFF;
+            haveColor = true;
+            env->DeleteLocalRef(mc2);
+        }
+    }
+
+    // Always get name for ore detection / fallback
+    if (method_block_getUnlocalizedName) {
+        jstring jn = (jstring)env->CallObjectMethod(block, method_block_getUnlocalizedName);
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        if (jn) {
+            const char* utf = env->GetStringUTFChars(jn, nullptr);
+            if (utf) {
+                uint8_t nf = 0;
+                COLORREF cf = FallbackColorFromName(utf, nf);
+                flagsOut |= nf;
+                if (!haveColor) {
+                    color = (int)cf & 0xFFFFFF;
+                    haveColor = true;
+                }
+                env->ReleaseStringUTFChars(jn, utf);
+            }
+            env->DeleteLocalRef(jn);
+        }
+    }
+
+    env->DeleteLocalRef(block);
+    env->DeleteLocalRef(state);
+
+    if (!haveColor) return -1;
+    // MapColor int is stored as RGB packed. Convert MC (R<<16|G<<8|B) -> COLORREF (B<<16|G<<8|R)
+    int r = (color >> 16) & 0xFF;
+    int g = (color >> 8) & 0xFF;
+    int b = color & 0xFF;
+    return (int)RGB(r, g, b);
+}
+
+void Java::EnumerateEntities(std::vector<MapEntity>& out, float selfX, float selfZ) {
+    out.clear();
+    if (!env || !listClass || !field_loadedEntityList || !entityClass ||
+        !field_posX || !field_posY || !field_posZ) return;
+
+    jobject mc = GetMinecraft();
+    if (!mc) return;
+    jobject world = env->GetObjectField(mc, field_theWorld);
+    jobject thePlayer = field_thePlayer ? env->GetObjectField(mc, field_thePlayer) : nullptr;
+    env->DeleteLocalRef(mc);
+    if (!world) { if (thePlayer) env->DeleteLocalRef(thePlayer); return; }
+
+    jobject list = env->GetObjectField(world, field_loadedEntityList);
+    // Build a set of "real" player refs from World.playerEntities so we can
+    // distinguish actual connected players from NPCs that happen to extend
+    // an EntityPlayer subclass (e.g. Citizens-style bots).
+    std::vector<jobject> realPlayers;
+    if (field_playerEntities) {
+        jobject pList = env->GetObjectField(world, field_playerEntities);
+        if (pList) {
+            jint pn = env->CallIntMethod(pList, method_list_size);
+            if (env->ExceptionCheck()) { env->ExceptionClear(); pn = 0; }
+            if (pn > 64) pn = 64;
+            realPlayers.reserve((size_t)pn);
+            for (jint j = 0; j < pn; j++) {
+                jobject pe = env->CallObjectMethod(pList, method_list_get, j);
+                if (env->ExceptionCheck()) { env->ExceptionClear(); continue; }
+                if (pe) realPlayers.push_back(pe); // local refs; released at end
+            }
+            env->DeleteLocalRef(pList);
+        }
+    }
+    env->DeleteLocalRef(world);
+    if (!list) {
+        for (auto r : realPlayers) env->DeleteLocalRef(r);
+        if (thePlayer) env->DeleteLocalRef(thePlayer);
+        return;
+    }
+
+    jint size = env->CallIntMethod(list, method_list_size);
+    if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+        env->DeleteLocalRef(list);
+        for (auto r : realPlayers) env->DeleteLocalRef(r);
+        if (thePlayer) env->DeleteLocalRef(thePlayer);
+        return;
+    }
+    if (size < 0) size = 0;
+    if (size > 512) size = 512; // safety cap
+
+    out.reserve((size_t)size);
+
+    for (jint i = 0; i < size; i++) {
+        jobject e = env->CallObjectMethod(list, method_list_get, i);
+        if (env->ExceptionCheck()) { env->ExceptionClear(); continue; }
+        if (!e) continue;
+
+        double ex = env->GetDoubleField(e, field_posX);
+        double ey = env->GetDoubleField(e, field_posY);
+        double ez = env->GetDoubleField(e, field_posZ);
+        float eyaw = env->GetFloatField(e, field_rotationYaw);
+
+        float dx = (float)ex - selfX;
+        float dz = (float)ez - selfZ;
+        float dist2 = dx * dx + dz * dz;
+        if (dist2 > 200.f * 200.f) { env->DeleteLocalRef(e); continue; }
+
+        // Determine type from class name
+        jclass ec = env->GetObjectClass(e);
+        char classSig[256] = {};
+        if (jvmti && ec) {
+            char* sig = nullptr;
+            jvmti->GetClassSignature(ec, &sig, nullptr);
+            if (sig) { strncpy_s(classSig, sig, sizeof(classSig) - 1); jvmti->Deallocate((unsigned char*)sig); }
+        }
+        if (ec) env->DeleteLocalRef(ec);
+
+        MapEntity me = {};
+        me.x = (float)ex; me.y = (float)ey; me.z = (float)ez; me.yaw = eyaw;
+        me.kind = 4; // default: item/other
+
+        // Self-filter: the local player is in loadedEntityList too.
+        if (thePlayer && env->IsSameObject(e, thePlayer)) me.isSelf = true;
+
+        std::string cs(classSig);
+        for (auto& c : cs) c = (char)tolower((unsigned char)c);
+
+        bool isPlayer = cs.find("player") != std::string::npos;
+        // Real player = present in World.playerEntities. NPC bots that extend
+        // EntityPlayer* but aren't in that list are filtered out.
+        if (isPlayer) {
+            for (auto rp : realPlayers) {
+                if (env->IsSameObject(e, rp)) { me.isRealPlayer = true; break; }
+            }
+        }
+        bool isHostile = cs.find("zombie") != std::string::npos || cs.find("skeleton") != std::string::npos
+            || cs.find("creeper") != std::string::npos || cs.find("spider") != std::string::npos
+            || cs.find("enderman") != std::string::npos || cs.find("witch") != std::string::npos
+            || cs.find("slime") != std::string::npos || cs.find("blaze") != std::string::npos
+            || cs.find("ghast") != std::string::npos || cs.find("pigzombie") != std::string::npos
+            || cs.find("wither") != std::string::npos || cs.find("silverfish") != std::string::npos
+            || cs.find("guardian") != std::string::npos || cs.find("shulker") != std::string::npos;
+        bool isPassive = cs.find("cow") != std::string::npos || cs.find("pig") != std::string::npos
+            || cs.find("sheep") != std::string::npos || cs.find("chicken") != std::string::npos
+            || cs.find("horse") != std::string::npos || cs.find("rabbit") != std::string::npos
+            || cs.find("villager") != std::string::npos || cs.find("wolf") != std::string::npos
+            || cs.find("ocelot") != std::string::npos || cs.find("bat") != std::string::npos
+            || cs.find("squid") != std::string::npos || cs.find("snowman") != std::string::npos
+            || cs.find("irongolem") != std::string::npos;
+
+        if (isPlayer) me.kind = 1;
+        else if (isHostile) me.kind = 2;
+        else if (isPassive) me.kind = 3;
+        else me.kind = 4;
+
+        // Get name
+        me.name[0] = 0;
+        if (method_getName || method_getCommandSenderName) {
+            jstring jn = nullptr;
+            if (method_getName) {
+                jn = (jstring)env->CallObjectMethod(e, method_getName);
+                if (env->ExceptionCheck()) { env->ExceptionClear(); jn = nullptr; }
+            }
+            if (!jn && method_getCommandSenderName) {
+                jn = (jstring)env->CallObjectMethod(e, method_getCommandSenderName);
+                if (env->ExceptionCheck()) { env->ExceptionClear(); jn = nullptr; }
+            }
+            if (jn) {
+                const char* u = env->GetStringUTFChars(jn, nullptr);
+                if (u) {
+                    strncpy_s(me.name, u, sizeof(me.name) - 1);
+                    env->ReleaseStringUTFChars(jn, u);
+                }
+                env->DeleteLocalRef(jn);
+            }
+        }
+
+        // Head color from name hash (deterministic per nickname)
+        if (me.kind == 1 && me.name[0]) {
+            unsigned h = 2166136261u;
+            for (const char* p = me.name; *p; p++) { h ^= (unsigned char)*p; h *= 16777619u; }
+            int hue = (int)(h % 360);
+            float s = 0.55f, v = 0.95f;
+            float c = v * s, x2 = c * (1 - fabsf(fmodf(hue / 60.0f, 2) - 1)), m = v - c;
+            float r = 0, g = 0, b = 0;
+            if (hue < 60) { r = c; g = x2; }
+            else if (hue < 120) { r = x2; g = c; }
+            else if (hue < 180) { g = c; b = x2; }
+            else if (hue < 240) { g = x2; b = c; }
+            else if (hue < 300) { r = x2; b = c; }
+            else { r = c; b = x2; }
+            me.headColor = RGB((int)((r + m) * 255), (int)((g + m) * 255), (int)((b + m) * 255));
+        }
+        else if (me.kind == 2) me.headColor = RGB(220, 60, 60);
+        else if (me.kind == 3) me.headColor = RGB(90, 190, 90);
+        else me.headColor = RGB(180, 180, 180);
+
+        // Health + absorption ONLY for actual EntityLivingBase instances.
+        // Calling getHealth() on a plain Entity (e.g. dropped item, arrow,
+        // xp orb) dispatches through a vtable that doesn't own the method
+        // and JVM-crashes the client. IsInstanceOf gates the call safely.
+        bool isLiving = (entityLivingClass && env->IsInstanceOf(e, entityLivingClass));
+        if (env->ExceptionCheck()) { env->ExceptionClear(); isLiving = false; }
+        if (isLiving) {
+            if (method_getHealth) {
+                me.health = env->CallFloatMethod(e, method_getHealth);
+                if (env->ExceptionCheck()) { env->ExceptionClear(); me.health = 0.f; }
+            }
+            if (method_getMaxHealth) {
+                me.maxHealth = env->CallFloatMethod(e, method_getMaxHealth);
+                if (env->ExceptionCheck()) { env->ExceptionClear(); me.maxHealth = 0.f; }
+            }
+            if (method_getAbsorption) {
+                me.absorption = env->CallFloatMethod(e, method_getAbsorption);
+                if (env->ExceptionCheck()) { env->ExceptionClear(); me.absorption = 0.f; }
+            }
+        }
+
+        // Helmet detection: armorInventory[3] non-null = head slot occupied.
+        if (me.isRealPlayer && field_playerInventory && field_armorInventory) {
+            jobject inv = env->GetObjectField(e, field_playerInventory);
+            if (env->ExceptionCheck()) { env->ExceptionClear(); inv = nullptr; }
+            if (inv) {
+                jobject arr = env->GetObjectField(inv, field_armorInventory);
+                if (env->ExceptionCheck()) { env->ExceptionClear(); arr = nullptr; }
+                if (arr) {
+                    jobjectArray a = (jobjectArray)arr;
+                    jsize len = env->GetArrayLength(a);
+                    if (len >= 4) {
+                        jobject helm = env->GetObjectArrayElement(a, 3);
+                        if (env->ExceptionCheck()) { env->ExceptionClear(); helm = nullptr; }
+                        if (helm) { me.hasHelmet = true; env->DeleteLocalRef(helm); }
+                    }
+                    env->DeleteLocalRef(arr);
+                }
+                env->DeleteLocalRef(inv);
+            }
+        }
+
+        out.push_back(me);
+        env->DeleteLocalRef(e);
+    }
+
+    for (auto r : realPlayers) env->DeleteLocalRef(r);
+    if (thePlayer) env->DeleteLocalRef(thePlayer);
+    env->DeleteLocalRef(list);
+}
+
+// ===================== NICK DIALOG =====================
+static HBRUSH g_nickDlgBgBrush = nullptr;
+static HBRUSH g_nickDlgEditBgBrush = nullptr;
+static HFONT g_nickDlgFont = nullptr;
+static HFONT g_nickDlgFontBig = nullptr;
+
+static LRESULT CALLBACK NickDialogProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+    case WM_CREATE: {
+        g_nickDlgBgBrush = CreateSolidBrush(RGB(18, 18, 25));
+        g_nickDlgEditBgBrush = CreateSolidBrush(RGB(35, 35, 50));
+        g_nickDlgFont = CreateFontA(14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, ANSI_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, "Segoe UI");
+        g_nickDlgFontBig = CreateFontA(20, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, ANSI_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, "Segoe UI");
+
+        HWND titleLbl = CreateWindowExA(0, "STATIC", "CHANGE NICKNAME", WS_CHILD | WS_VISIBLE | SS_CENTER, 0, 15, 360, 28, hwnd, (HMENU)200, nullptr, nullptr);
+        SendMessage(titleLbl, WM_SETFONT, (WPARAM)g_nickDlgFontBig, TRUE);
+
+        HWND descLbl = CreateWindowExA(0, "STATIC", "Enter new name (3-16 characters, A-Z, 0-9, _)", WS_CHILD | WS_VISIBLE | SS_CENTER, 20, 55, 320, 20, hwnd, (HMENU)201, nullptr, nullptr);
+        SendMessage(descLbl, WM_SETFONT, (WPARAM)g_nickDlgFont, TRUE);
+
+        char curNickText[96] = {};
+        if (g_settings.nickname[0] != '\0')
+            snprintf(curNickText, sizeof(curNickText), "Current: %s", g_settings.nickname);
+        else
+            snprintf(curNickText, sizeof(curNickText), "Current: (default)");
+
+        HWND curLbl = CreateWindowExA(0, "STATIC", curNickText, WS_CHILD | WS_VISIBLE | SS_CENTER, 20, 80, 320, 18, hwnd, (HMENU)202, nullptr, nullptr);
+        SendMessage(curLbl, WM_SETFONT, (WPARAM)g_nickDlgFont, TRUE);
+
+        g_nickEditCtrl = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT",
+            g_settings.nickname[0] != '\0' ? g_settings.nickname : "",
+            WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_CENTER,
+            40, 110, 280, 32, hwnd, (HMENU)101, nullptr, nullptr);
+        SendMessage(g_nickEditCtrl, WM_SETFONT, (WPARAM)g_nickDlgFont, TRUE);
+        SendMessage(g_nickEditCtrl, EM_SETLIMITTEXT, 16, 0);
+
+        HWND btnApply = CreateWindowExA(0, "BUTTON", "APPLY", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | BS_FLAT, 80, 160, 100, 36, hwnd, (HMENU)102, nullptr, nullptr);
+        SendMessage(btnApply, WM_SETFONT, (WPARAM)g_nickDlgFont, TRUE);
+
+        HWND btnCancel = CreateWindowExA(0, "BUTTON", "CANCEL", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | BS_FLAT, 190, 160, 90, 36, hwnd, (HMENU)103, nullptr, nullptr);
+        SendMessage(btnCancel, WM_SETFONT, (WPARAM)g_nickDlgFont, TRUE);
+
+        g_nickStatusLabel = CreateWindowExA(0, "STATIC", "", WS_CHILD | WS_VISIBLE | SS_CENTER, 20, 210, 320, 18, hwnd, (HMENU)203, nullptr, nullptr);
+        SendMessage(g_nickStatusLabel, WM_SETFONT, (WPARAM)g_nickDlgFont, TRUE);
+
+        SetFocus(g_nickEditCtrl);
+        return 0;
+    }
+    case WM_CTLCOLORSTATIC: {
+        HDC hdcS = (HDC)wParam;
+        SetBkMode(hdcS, TRANSPARENT);
+        int id = GetDlgCtrlID((HWND)lParam);
+        if (id == 200) SetTextColor(hdcS, RGB(100, 200, 255));
+        else if (id == 203) SetTextColor(hdcS, RGB(100, 255, 150));
+        else SetTextColor(hdcS, RGB(200, 200, 220));
+        return (LRESULT)g_nickDlgBgBrush;
+    }
+    case WM_CTLCOLOREDIT: {
+        HDC hdcE = (HDC)wParam;
+        SetTextColor(hdcE, RGB(255, 255, 255));
+        SetBkColor(hdcE, RGB(35, 35, 50));
+        return (LRESULT)g_nickDlgEditBgBrush;
+    }
+    case WM_CTLCOLORBTN:
+        return (LRESULT)g_nickDlgBgBrush;
+    case WM_ERASEBKGND: {
+        HDC hdc = (HDC)wParam;
+        RECT rc2;
+        GetClientRect(hwnd, &rc2);
+        FillRect(hdc, &rc2, g_nickDlgBgBrush);
+        HPEN pen = CreatePen(PS_SOLID, 3, RGB(100, 200, 255));
+        HPEN oldPen = (HPEN)SelectObject(hdc, pen);
+        MoveToEx(hdc, 30, 48, nullptr);
+        LineTo(hdc, 330, 48);
+        SelectObject(hdc, oldPen);
+        DeleteObject(pen);
+        return TRUE;
+    }
+    case WM_COMMAND:
+        if (LOWORD(wParam) == 103) { DestroyWindow(hwnd); g_nickDialogWnd = nullptr; return 0; }
+        if (LOWORD(wParam) == 102) {
+            char buf[64] = {};
+            GetWindowTextA(g_nickEditCtrl, buf, sizeof(buf));
+            int len = (int)strlen(buf);
+            if (len < 3) { if (g_nickStatusLabel) SetWindowTextA(g_nickStatusLabel, "Name too short! (min 3)"); return 0; }
+            if (len > 16) { if (g_nickStatusLabel) SetWindowTextA(g_nickStatusLabel, "Name too long! (max 16)"); return 0; }
+            bool validChars = true;
+            for (int i = 0; i < len; i++) {
+                char c = buf[i];
+                if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_')) {
+                    validChars = false;
+                    break;
+                }
+            }
+            if (!validChars) { if (g_nickStatusLabel) SetWindowTextA(g_nickStatusLabel, "Only A-Z, 0-9, _ allowed!"); return 0; }
+            strncpy_s(g_settings.nickname, buf, sizeof(g_settings.nickname) - 1);
+            strncpy_s(g_pendingNick, buf, sizeof(g_pendingNick) - 1);
+            g_nickApplyPending = true;
+            if (g_nickStatusLabel) {
+                char sm[96];
+                snprintf(sm, sizeof(sm), "Applying: %s ...", buf);
+                SetWindowTextA(g_nickStatusLabel, sm);
+            }
+            SetTimer(hwnd, 50, 1500, nullptr);
+            return 0;
+        }
+        break;
+    case WM_TIMER:
+        if (wParam == 50) { KillTimer(hwnd, 50); DestroyWindow(hwnd); g_nickDialogWnd = nullptr; return 0; }
+        break;
+    case WM_KEYDOWN:
+        if (wParam == VK_RETURN) { SendMessage(hwnd, WM_COMMAND, 102, 0); return 0; }
+        if (wParam == VK_ESCAPE) { DestroyWindow(hwnd); g_nickDialogWnd = nullptr; return 0; }
+        break;
+    case WM_CLOSE:
+        DestroyWindow(hwnd);
+        g_nickDialogWnd = nullptr;
+        return 0;
+    case WM_DESTROY:
+        if (g_nickDlgBgBrush) { DeleteObject(g_nickDlgBgBrush); g_nickDlgBgBrush = nullptr; }
+        if (g_nickDlgEditBgBrush) { DeleteObject(g_nickDlgEditBgBrush); g_nickDlgEditBgBrush = nullptr; }
+        if (g_nickDlgFont) { DeleteObject(g_nickDlgFont); g_nickDlgFont = nullptr; }
+        if (g_nickDlgFontBig) { DeleteObject(g_nickDlgFontBig); g_nickDlgFontBig = nullptr; }
+        g_nickDialogWnd = nullptr;
+        g_nickStatusLabel = nullptr;
+        return 0;
+    }
+    return DefWindowProcA(hwnd, msg, wParam, lParam);
+}
+
+static void OpenNickDialog(HINSTANCE hInst) {
+    if (g_nickDialogWnd && IsWindow(g_nickDialogWnd)) {
+        SetForegroundWindow(g_nickDialogWnd);
+        SetFocus(g_nickEditCtrl);
+        return;
+    }
+    static bool reg = false;
+    if (!reg) {
+        WNDCLASSEXA wc = {};
+        wc.cbSize = sizeof(wc);
+        wc.lpfnWndProc = NickDialogProc;
+        wc.hInstance = hInst;
+        wc.lpszClassName = "KarvisNickDlg";
+        wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+        wc.hbrBackground = CreateSolidBrush(RGB(18, 18, 25));
+        RegisterClassExA(&wc);
+        reg = true;
+    }
+    int screenW = GetSystemMetrics(SM_CXSCREEN);
+    int screenH = GetSystemMetrics(SM_CYSCREEN);
+    int dlgW = 360, dlgH = 250;
+    int dlgX = (screenW - dlgW) / 2;
+    int dlgY = (screenH - dlgH) / 2;
+    g_nickDialogWnd = CreateWindowExA(WS_EX_TOPMOST | WS_EX_TOOLWINDOW, "KarvisNickDlg", "Karvis Files - Nickname",
+        WS_POPUP | WS_CAPTION | WS_SYSMENU, dlgX, dlgY, dlgW, dlgH, nullptr, nullptr, hInst, nullptr);
+    if (g_nickDialogWnd) {
+        ShowWindow(g_nickDialogWnd, SW_SHOW);
+        UpdateWindow(g_nickDialogWnd);
+        SetForegroundWindow(g_nickDialogWnd);
+    }
+}
+
+// ===================== MINIMAP OVERLAY =====================
+static HBITMAP g_mapBmp = nullptr;
+static HDC     g_mapMemDC = nullptr;
+static int     g_mapBmpW = 0, g_mapBmpH = 0;
+static HFONT   g_mapFont = nullptr;
+static HFONT   g_mapFontBold = nullptr;
+
+static int MapPixelSize() {
+    switch (g_settings.mapSize) {
+    case 0: return 140;   // Small
+    case 1: return 180;   // Medium
+    case 2: return 224;   // Large
+    case 3: return 288;   // X-Large
+    case 4: return 360;   // XX-Large
+    case 5: return 440;   // Huge
+    default: return 224;
+    }
+}
+
+static int MapBlocksPerPixelMul10() {
+    // zoom 1..5 -> blocks-per-pixel: 1.6, 1.2, 0.9, 0.6, 0.4
+    switch (g_settings.mapZoom) {
+    case 1: return 16;
+    case 2: return 12;
+    case 3: return 9;
+    case 4: return 6;
+    case 5: return 4;
+    default: return 12;
+    }
+}
+
+// Smooth a sample color based on flags (highlight ore, dim caves)
+static COLORREF ApplyFlagsTint(COLORREF c, uint8_t flags) {
+    int r = GetRValue(c), g = GetGValue(c), b = GetBValue(c);
+    if (flags & 1) { // ore: boost saturation / brighten
+        r = min(255, r + 30);
+        g = min(255, g + 30);
+        b = min(255, b + 30);
+    }
+    if (flags & 2) { // cave
+        r = r * 3 / 5; g = g * 3 / 5; b = b * 3 / 5;
+    }
+    return RGB(r, g, b);
+}
+
+static void DrawPlayerArrow(HDC hdc, int cx, int cy, float yawDeg, COLORREF fill, COLORREF outline) {
+    float yaw = yawDeg * 3.14159265f / 180.0f;
+    float s = sinf(yaw), co = cosf(yaw);
+    POINT pts[3];
+    auto tr = [&](float fx, float fy, int idx) {
+        float rx = fx * co - fy * s;
+        float ry = fx * s + fy * co;
+        pts[idx].x = cx + (int)rx;
+        pts[idx].y = cy + (int)ry;
+        };
+    tr(0.0f, -7.0f, 0);
+    tr(5.0f, 5.0f, 1);
+    tr(-5.0f, 5.0f, 2);
+    HBRUSH br = CreateSolidBrush(fill);
+    HPEN pn = CreatePen(PS_SOLID, 2, outline);
+    HBRUSH ob = (HBRUSH)SelectObject(hdc, br);
+    HPEN op = (HPEN)SelectObject(hdc, pn);
+    Polygon(hdc, pts, 3);
+    SelectObject(hdc, ob); SelectObject(hdc, op);
+    DeleteObject(br); DeleteObject(pn);
+}
+
+// Deterministic name hash
+static uint32_t NameHash(const char* s) {
+    uint32_t h = 2166136261u;
+    if (!s) return h;
+    for (const unsigned char* p = (const unsigned char*)s; *p; p++) {
+        h ^= *p;
+        h *= 16777619u;
+    }
+    return h;
+}
+
+// Build an 8x8 pixel-art Minecraft-style head into the given buffer (row-major BGRA).
+// Generates skin/hair/eye variations deterministically from the player name hash.
+static void BuildHeadPixels(const char* name, uint32_t pixels[64]) {
+    uint32_t h = NameHash(name);
+
+    // Skin palette (Minecraft-ish Steve-to-variant tones)
+    static const COLORREF skinPalette[8] = {
+        RGB(251, 224, 196), // very pale
+        RGB(244, 205, 168), // light
+        RGB(227, 183, 141), // Steve default-ish
+        RGB(200, 151, 110), // tan
+        RGB(170, 124, 87),  // medium
+        RGB(135, 92, 61),   // brown
+        RGB(96,  64, 42),   // dark brown
+        RGB(70,  45, 28),   // very dark
+    };
+    // Hair palette
+    static const COLORREF hairPalette[8] = {
+        RGB(35, 25, 20),    // near-black
+        RGB(58, 38, 22),    // dark brown (Steve)
+        RGB(92, 57, 32),    // brown
+        RGB(140, 92, 45),   // medium brown
+        RGB(190, 140, 70),  // dirty blonde
+        RGB(230, 200, 110), // blonde
+        RGB(170, 50, 40),   // red/ginger
+        RGB(150, 150, 160), // silver/gray
+    };
+
+    int skinIdx = (h >> 2) & 7;
+    int hairIdx = (h >> 6) & 7;
+    int hairStyle = (h >> 10) & 3;   // 0..3 different hair patterns
+    int eyeTone = (h >> 14) & 3;     // 0..3 eye variations
+    bool mouthSmile = ((h >> 16) & 1) != 0;
+
+    COLORREF skin = skinPalette[skinIdx];
+    COLORREF hair = hairPalette[hairIdx];
+
+    // Shade helpers
+    auto shade = [](COLORREF c, int delta) -> COLORREF {
+        int r = (int)GetRValue(c) + delta; if (r < 0) r = 0; if (r > 255) r = 255;
+        int g = (int)GetGValue(c) + delta; if (g < 0) g = 0; if (g > 255) g = 255;
+        int b = (int)GetBValue(c) + delta; if (b < 0) b = 0; if (b > 255) b = 255;
+        return RGB(r, g, b);
+        };
+
+    COLORREF skinDark = shade(skin, -22);
+    COLORREF skinLight = shade(skin, 12);
+    COLORREF hairDark = shade(hair, -18);
+
+    static const COLORREF eyeColors[4] = {
+        RGB(60, 45, 30),    // brown
+        RGB(40, 80, 160),   // blue
+        RGB(50, 110, 60),   // green
+        RGB(100, 70, 40),   // hazel
+    };
+    COLORREF eye = eyeColors[eyeTone];
+
+    // Template (8 rows x 8 cols). Chars:
+    //   H=hair, h=hairDark, S=skin, s=skinDark, l=skinLight, E=eye, M=mouth(skinDark), .=skin
+    static const char* styles[4][8] = {
+        // Style 0 - classic short
+        {
+            "HHHHHHHH",
+            "HHHHHHHH",
+            "HhhhhhhH",
+            "SSESSESS",
+            "SSSSSSSS",
+            "SSMMMMSS",
+            "SSSSSSSS",
+            "SssSSssS",
+        },
+        // Style 1 - longer hair / fringe
+        {
+            "HHHHHHHH",
+            "HHHHHHHH",
+            "HHHhhhHH",
+            "HSESSESH",
+            "SSSSSSSS",
+            "SSMMMMSS",
+            "SSSSSSSS",
+            "sSSSSSSs",
+        },
+        // Style 2 - messy bangs
+        {
+            "hHHhHHhh",
+            "HHHHHHHH",
+            "HhhhhhhH",
+            "SSESSESS",
+            "SSSSSSSS",
+            "SSsMMsSS",
+            "SSSSSSSS",
+            "sSSssSSs",
+        },
+        // Style 3 - tight / skin-showing
+        {
+            "sHHHHHHs",
+            "HHHHHHHH",
+            "SSSSSSSS",
+            "SSESSESS",
+            "SSSSSSSS",
+            "SSMMMMSS",
+            "SSSSSSSS",
+            "SSSSSSSS",
+        },
+    };
+
+    const char* const* tmpl = styles[hairStyle];
+
+    for (int y = 0; y < 8; y++) {
+        for (int x = 0; x < 8; x++) {
+            char c = tmpl[y][x];
+            COLORREF px;
+            switch (c) {
+            case 'H': px = hair; break;
+            case 'h': px = hairDark; break;
+            case 'S': px = skin; break;
+            case 's': px = skinDark; break;
+            case 'l': px = skinLight; break;
+            case 'E': px = eye; break;
+            case 'M': px = mouthSmile ? shade(skin, -45) : shade(skin, -30); break;
+            default:  px = skin; break;
+            }
+            // BGRA 32-bit
+            uint8_t r = GetRValue(px), g = GetGValue(px), b = GetBValue(px);
+            pixels[y * 8 + x] = (uint32_t)(0xFFu << 24) | ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+        }
+    }
+}
+
+static void DrawPlayerHead(HDC hdc, int cx, int cy, int pixelSize, const char* name) {
+    // pixelSize = target drawing size (e.g. 14..22 depending on map zoom)
+    if (pixelSize < 10) pixelSize = 10;
+    if (pixelSize > 40) pixelSize = 40;
+
+    uint32_t head[64];
+    BuildHeadPixels(name ? name : "", head);
+
+    BITMAPINFO bi = {};
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = 8;
+    bi.bmiHeader.biHeight = -8;       // top-down
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+
+    int dx = cx - pixelSize / 2;
+    int dy = cy - pixelSize / 2;
+
+    // Drop shadow behind head
+    HBRUSH shBr = CreateSolidBrush(RGB(0, 0, 0));
+    RECT sh = { dx + 1, dy + 1, dx + pixelSize + 1, dy + pixelSize + 1 };
+    FillRect(hdc, &sh, shBr);
+    DeleteObject(shBr);
+
+    int oldMode = SetStretchBltMode(hdc, COLORONCOLOR); // nearest-neighbor - keeps pixel art crisp
+    StretchDIBits(hdc, dx, dy, pixelSize, pixelSize,
+        0, 0, 8, 8, head, &bi, DIB_RGB_COLORS, SRCCOPY);
+    SetStretchBltMode(hdc, oldMode);
+
+    // Thin outline
+    HPEN pn = CreatePen(PS_SOLID, 1, RGB(0, 0, 0));
+    HPEN op = (HPEN)SelectObject(hdc, pn);
+    HBRUSH ob = (HBRUSH)SelectObject(hdc, GetStockObject(NULL_BRUSH));
+    Rectangle(hdc, dx - 1, dy - 1, dx + pixelSize + 1, dy + pixelSize + 1);
+    SelectObject(hdc, op); SelectObject(hdc, ob);
+    DeleteObject(pn);
+}
+
+static void DrawMapDot(HDC hdc, int cx, int cy, COLORREF color, int r) {
+    HBRUSH br = CreateSolidBrush(color);
+    HPEN pn = CreatePen(PS_SOLID, 1, RGB(0, 0, 0));
+    HBRUSH ob = (HBRUSH)SelectObject(hdc, br);
+    HPEN op = (HPEN)SelectObject(hdc, pn);
+    Ellipse(hdc, cx - r, cy - r, cx + r + 1, cy + r + 1);
+    SelectObject(hdc, ob); SelectObject(hdc, op);
+    DeleteObject(br); DeleteObject(pn);
+}
+
+// Draws a simple steel-tinted cap on top of a player head to indicate a helmet.
+// The head quad is [cx - size/2, cy - size/2] .. [cx + size/2, cy + size/2].
+static void DrawHelmetOverlay(HDC hdc, int cx, int cy, int size) {
+    int half = size / 2;
+    int left = cx - half, top = cy - half;
+    int capH = size / 3; if (capH < 4) capH = 4;
+
+    // Cap body
+    HBRUSH cb = CreateSolidBrush(RGB(170, 175, 185));
+    RECT cr = { left - 1, top - 2, left + size + 1, top + capH };
+    FillRect(hdc, &cr, cb);
+    DeleteObject(cb);
+
+    // Highlight strip
+    HBRUSH hi = CreateSolidBrush(RGB(215, 220, 230));
+    RECT hr = { left - 1, top - 2, left + size + 1, top - 1 };
+    FillRect(hdc, &hr, hi);
+    DeleteObject(hi);
+
+    // Side flaps coming down over the ears
+    HBRUSH fb = CreateSolidBrush(RGB(135, 140, 150));
+    RECT lf = { left - 2, top + capH - 1, left + 1, top + capH + 3 };
+    RECT rf = { left + size - 1, top + capH - 1, left + size + 2, top + capH + 3 };
+    FillRect(hdc, &lf, fb);
+    FillRect(hdc, &rf, fb);
+    DeleteObject(fb);
+
+    // Thin outline
+    HPEN pn = CreatePen(PS_SOLID, 1, RGB(0, 0, 0));
+    HPEN op = (HPEN)SelectObject(hdc, pn);
+    HBRUSH ob = (HBRUSH)SelectObject(hdc, GetStockObject(NULL_BRUSH));
+    Rectangle(hdc, left - 2, top - 3, left + size + 2, top + capH + 1);
+    SelectObject(hdc, op); SelectObject(hdc, ob);
+    DeleteObject(pn);
+}
+
+// Minecraft-style HP bar above a head. Draws one row of red hearts for
+// `health` (each heart = 2 HP, max 10 per row), then a row of gold hearts
+// for `absorption` immediately above. Each heart is a tiny filled lobe +
+// triangle shape that reads as a heart at minimap scale.
+static void DrawHeart(HDC hdc, int x, int y, int sz, COLORREF fill, COLORREF dark) {
+    // Two filled lobes on top + downward triangle = heart shape.
+    HBRUSH br = CreateSolidBrush(fill);
+    HPEN   pn = CreatePen(PS_SOLID, 1, dark);
+    HBRUSH ob = (HBRUSH)SelectObject(hdc, br);
+    HPEN   op = (HPEN)SelectObject(hdc, pn);
+
+    int lobeR = sz / 3;
+    if (lobeR < 2) lobeR = 2;
+    Ellipse(hdc, x, y, x + 2 * lobeR, y + 2 * lobeR);
+    Ellipse(hdc, x + sz - 2 * lobeR, y, x + sz, y + 2 * lobeR);
+    POINT tri[3] = {
+        { x,          y + lobeR },
+        { x + sz - 1, y + lobeR },
+        { x + sz / 2, y + sz    }
+    };
+    Polygon(hdc, tri, 3);
+
+    SelectObject(hdc, op);
+    SelectObject(hdc, ob);
+    DeleteObject(pn);
+    DeleteObject(br);
+}
+
+static void DrawHeartRow(HDC hdc, int cx, int topY, int count, bool absorption) {
+    if (count <= 0) return;
+    if (count > 10) count = 10;
+    int sz = 6;
+    int gap = 1;
+    int rowW = count * sz + (count - 1) * gap;
+    int x = cx - rowW / 2;
+    COLORREF fill = absorption ? RGB(252, 204, 64) : RGB(230, 40, 50);
+    COLORREF dark = absorption ? RGB(90, 66, 12) : RGB(80, 0, 0);
+    for (int i = 0; i < count; i++) {
+        DrawHeart(hdc, x + i * (sz + gap), topY, sz, fill, dark);
+    }
+}
+
+static void RenderMinimapTo(HDC hdc, int mapW, int mapH) {
+    // Ensure backbuffer
+    if (!g_mapMemDC || g_mapBmpW != mapW || g_mapBmpH != mapH) {
+        if (g_mapBmp) { DeleteObject(g_mapBmp); g_mapBmp = nullptr; }
+        if (g_mapMemDC) { DeleteDC(g_mapMemDC); g_mapMemDC = nullptr; }
+        g_mapMemDC = CreateCompatibleDC(hdc);
+        g_mapBmp = CreateCompatibleBitmap(hdc, mapW, mapH);
+        SelectObject(g_mapMemDC, g_mapBmp);
+        g_mapBmpW = mapW;
+        g_mapBmpH = mapH;
+    }
+    HDC dc = g_mapMemDC;
+
+    // Use color key transparent color (magenta) outside clip
+    HBRUSH clear = CreateSolidBrush(RGB(255, 0, 255));
+    RECT clearR = { 0, 0, mapW, mapH };
+    FillRect(dc, &clearR, clear);
+    DeleteObject(clear);
+
+    // Clip region (round or square)
+    HRGN clipRgn = nullptr;
+    if (g_settings.mapRound) clipRgn = CreateEllipticRgn(2, 2, mapW - 2, mapH - 2);
+    else clipRgn = CreateRoundRectRgn(2, 2, mapW - 1, mapH - 1, 8, 8);
+    SelectClipRgn(dc, clipRgn);
+
+    // Paint BG inside clip
+    HBRUSH bgBr = CreateSolidBrush(RGB(18, 22, 28));
+    FillRgn(dc, clipRgn, bgBr);
+    DeleteObject(bgBr);
+
+    MapData snap;
+    if (g_mapCSReady) {
+        EnterCriticalSection(&g_mapCS);
+        snap.centerBlockX = g_map.centerBlockX;
+        snap.centerBlockZ = g_map.centerBlockZ;
+        snap.playerX = g_map.playerX;
+        snap.playerY = g_map.playerY;
+        snap.playerZ = g_map.playerZ;
+        snap.playerYaw = g_map.playerYaw;
+        snap.underground = g_map.underground;
+        snap.valid = g_map.valid;
+        memcpy(snap.samples, g_map.samples, sizeof(g_map.samples));
+        snap.entities = g_map.entities;
+        LeaveCriticalSection(&g_mapCS);
+    }
+
+    if (snap.valid) {
+        // Compose a small DIB from samples and stretch-blit to fit mapW/mapH
+        BITMAPINFO bi = {};
+        bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bi.bmiHeader.biWidth = TERRAIN_DIM;
+        bi.bmiHeader.biHeight = -TERRAIN_DIM; // top-down
+        bi.bmiHeader.biPlanes = 1;
+        bi.bmiHeader.biBitCount = 32;
+        bi.bmiHeader.biCompression = BI_RGB;
+
+        static std::vector<uint32_t> buf(TERRAIN_DIM * TERRAIN_DIM);
+        // BG color used for tiles we haven't sampled yet (during progressive
+        // load). Matches the minimap background so unsampled rows blend in
+        // seamlessly instead of appearing as solid black strips.
+        const uint32_t UNSAMPLED = 0xFF12161Cu; // 0xAARRGGBB = RGB(18,22,28)
+        for (int y = 0; y < TERRAIN_DIM; y++) {
+            for (int x = 0; x < TERRAIN_DIM; x++) {
+                const MapSample& s = snap.samples[y * TERRAIN_DIM + x];
+                // yTop == 0 and no flags means the tile has never been sampled.
+                if (s.yTop == 0 && s.color == 0 && s.flags == 0) {
+                    buf[y * TERRAIN_DIM + x] = UNSAMPLED;
+                    continue;
+                }
+                COLORREF c = ApplyFlagsTint(s.color, s.flags);
+                // add simple shading based on height difference vs north neighbor
+                int yn = y > 0 ? snap.samples[(y - 1) * TERRAIN_DIM + x].yTop : s.yTop;
+                int dy = s.yTop - yn;
+                int r = GetRValue(c), g = GetGValue(c), b = GetBValue(c);
+                if (dy > 0) { r = min(255, r + 18); g = min(255, g + 18); b = min(255, b + 18); }
+                else if (dy < 0) { r = max(0, r - 18); g = max(0, g - 18); b = max(0, b - 18); }
+                buf[y * TERRAIN_DIM + x] = (uint32_t)(0xFF000000u | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b);
+            }
+        }
+
+        // Compute scale: terrain covers TERRAIN_DIM*BPP blocks. Render so player stays centered.
+        // Player offset within the grid (since centerBlockX is sample (64,64))
+        float subX = snap.playerX - (float)snap.centerBlockX;
+        float subZ = snap.playerZ - (float)snap.centerBlockZ;
+        float bpp = MapBlocksPerPixelMul10() / 10.0f;
+        int terrainPx = (int)(TERRAIN_DIM / bpp);
+        int subPxX = (int)(subX / bpp);
+        int subPxZ = (int)(subZ / bpp);
+
+        int destX = (mapW / 2) - (terrainPx / 2) - subPxX;
+        int destY = (mapH / 2) - (terrainPx / 2) - subPxZ;
+
+        SetStretchBltMode(dc, HALFTONE);
+        SetBrushOrgEx(dc, 0, 0, nullptr);
+        StretchDIBits(dc, destX, destY, terrainPx, terrainPx,
+            0, 0, TERRAIN_DIM, TERRAIN_DIM, buf.data(), &bi, DIB_RGB_COLORS, SRCCOPY);
+
+        // Entities
+        if (g_settings.mapShowEntities) {
+            // Head size scales with map size for readability
+            int headSz = mapW / 14;
+            if (headSz < 12) headSz = 12;
+            if (headSz > 24) headSz = 24;
+
+            for (const auto& e : snap.entities) {
+                // Never draw the local player - only the center arrow represents us.
+                if (e.isSelf) continue;
+                // Drop every non-real-player entity: fake EntityPlayer bots
+                // (named NPCs on servers like Hypixel lobbies), passive mobs
+                // and item / xp-orb / other entities. The minimap now only
+                // displays actual connected players and hostile mobs.
+                if (e.kind == 1 && !e.isRealPlayer) continue;
+                if (e.kind == 3) continue; // passive mobs (villagers, cows ...)
+                if (e.kind == 4) continue; // items, xp orbs, arrows, etc.
+
+                float ex = (e.x - snap.playerX) / bpp;
+                float ez = (e.z - snap.playerZ) / bpp;
+                int ix = (int)(mapW / 2 + ex);
+                int iy = (int)(mapH / 2 + ez);
+                int margin = headSz / 2 + 2;
+                if (ix < margin || ix > mapW - margin || iy < margin || iy > mapH - margin) continue;
+
+                if (e.kind == 1 && g_settings.mapShowHeads) {
+                    DrawPlayerHead(dc, ix, iy, headSz, e.name);
+                    if (e.hasHelmet) DrawHelmetOverlay(dc, ix, iy, headSz);
+
+                    if (g_settings.mapShowNames && e.name[0]) {
+                        SelectObject(dc, g_mapFont);
+                        SetBkMode(dc, TRANSPARENT);
+                        int tagY = iy + headSz / 2 + 2;
+                        RECT tr = { ix - 50, tagY, ix + 50, tagY + 14 };
+                        RECT tsh = { tr.left + 1, tr.top + 1, tr.right + 1, tr.bottom + 1 };
+                        SetTextColor(dc, RGB(0, 0, 0));
+                        DrawTextA(dc, e.name, -1, &tsh, DT_CENTER | DT_SINGLELINE | DT_TOP | DT_NOPREFIX);
+                        SetTextColor(dc, RGB(245, 248, 255));
+                        DrawTextA(dc, e.name, -1, &tr, DT_CENTER | DT_SINGLELINE | DT_TOP | DT_NOPREFIX);
+                    }
+                }
+                else if (e.kind == 1) {
+                    DrawMapDot(dc, ix, iy, RGB(90, 200, 255), 4);
+                }
+                else if (e.kind == 2) {
+                    DrawMapDot(dc, ix, iy, RGB(230, 60, 60), 4);
+                }
+                else if (e.kind == 3) {
+                    DrawMapDot(dc, ix, iy, RGB(90, 200, 90), 3);
+                }
+                else {
+                    DrawMapDot(dc, ix, iy, RGB(210, 210, 80), 2);
+                }
+            }
+        }
+
+        // Self - arrow at center pointing yaw
+        DrawPlayerArrow(dc, mapW / 2, mapH / 2, snap.playerYaw + 180.0f, RGB(255, 255, 255), RGB(0, 0, 0));
+    }
+    else {
+        SelectObject(dc, g_mapFont);
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, RGB(180, 180, 200));
+        RECT tr = { 0, mapH / 2 - 8, mapW, mapH / 2 + 8 };
+        DrawTextA(dc, "Loading...", -1, &tr, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+    }
+
+    // Reset clip for border / UI
+    SelectClipRgn(dc, nullptr);
+
+    // Border
+    HPEN bPen = CreatePen(PS_SOLID, 2, RGB(100, 200, 255));
+    HPEN op = (HPEN)SelectObject(dc, bPen);
+    HBRUSH ob = (HBRUSH)SelectObject(dc, GetStockObject(NULL_BRUSH));
+    if (g_settings.mapRound) Ellipse(dc, 2, 2, mapW - 2, mapH - 2);
+    else RoundRect(dc, 2, 2, mapW - 1, mapH - 1, 8, 8);
+    SelectObject(dc, op); SelectObject(dc, ob);
+    DeleteObject(bPen);
+
+    // Cardinal N
+    SelectObject(dc, g_mapFontBold);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, RGB(0, 0, 0));
+    RECT nsh = { mapW / 2 - 8, 4, mapW / 2 + 8, 20 };
+    DrawTextA(dc, "N", -1, &nsh, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+    nsh.left++; nsh.top++; nsh.right++; nsh.bottom++;
+    SetTextColor(dc, RGB(255, 80, 80));
+    RECT nR = { mapW / 2 - 8, 3, mapW / 2 + 8, 19 };
+    DrawTextA(dc, "N", -1, &nR, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+
+    DeleteObject(clipRgn);
+
+    // Blit to target hdc
+    BitBlt(hdc, 0, 0, mapW, mapH, g_mapMemDC, 0, 0, SRCCOPY);
+}
+
+LRESULT CALLBACK MapWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+    case WM_CREATE:
+        SetTimer(hWnd, 2, 33, nullptr);
+        return 0;
+    case WM_TIMER:
+        InvalidateRect(hWnd, nullptr, FALSE);
+        return 0;
+    case WM_ERASEBKGND:
+        return TRUE;
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hWnd, &ps);
+        RECT cr; GetClientRect(hWnd, &cr);
+        RenderMinimapTo(hdc, cr.right, cr.bottom);
+        EndPaint(hWnd, &ps);
+        return 0;
+    }
+    case WM_MOUSEACTIVATE:
+        return MA_NOACTIVATE;
+    case WM_DESTROY:
+        KillTimer(hWnd, 2);
+        if (g_mapBmp) { DeleteObject(g_mapBmp); g_mapBmp = nullptr; }
+        if (g_mapMemDC) { DeleteDC(g_mapMemDC); g_mapMemDC = nullptr; }
+        g_mapBmpW = g_mapBmpH = 0;
+        return 0;
+    }
+    return DefWindowProc(hWnd, msg, wParam, lParam);
+}
+
+static void PositionMapWindow() {
+    if (!g_mapWnd) return;
+    int sz = MapPixelSize();
+    HWND game = FindGameWindow();
+    RECT gr = {};
+    if (game && GetClientRect(game, &gr)) {
+        POINT tl = { gr.left, gr.top };
+        ClientToScreen(game, &tl);
+        int w = gr.right - gr.left;
+        int h = gr.bottom - gr.top;
+        int pad = 10;
+        int x = tl.x + pad, y = tl.y + pad;
+        switch (g_settings.mapCorner) {
+        case 0: x = tl.x + w - sz - pad; y = tl.y + pad; break;               // TR
+        case 1: x = tl.x + pad;          y = tl.y + pad; break;               // TL
+        case 2: x = tl.x + w - sz - pad; y = tl.y + h - sz - pad; break;      // BR
+        case 3: x = tl.x + pad;          y = tl.y + h - sz - pad; break;      // BL
+        }
+        SetWindowPos(g_mapWnd, HWND_TOPMOST, x, y, sz, sz, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    }
+    else {
+        int scrW = GetSystemMetrics(SM_CXSCREEN);
+        int x = scrW - sz - 20, y = 20;
+        SetWindowPos(g_mapWnd, HWND_TOPMOST, x, y, sz, sz, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    }
+}
+
+DWORD WINAPI MapWindowThread(LPVOID param) {
+    HINSTANCE hInst = (HINSTANCE)param;
+    static bool reg = false;
+    if (!reg) {
+        WNDCLASSEXA wc = {};
+        wc.cbSize = sizeof(wc);
+        wc.lpfnWndProc = MapWndProc;
+        wc.hInstance = hInst;
+        wc.hbrBackground = CreateSolidBrush(RGB(255, 0, 255));
+        wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+        wc.lpszClassName = "KarvisMinimap";
+        RegisterClassExA(&wc);
+        reg = true;
+    }
+    g_mapFont = CreateFontA(11, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, "Segoe UI");
+    g_mapFontBold = CreateFontA(13, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, "Segoe UI");
+
+    int sz = MapPixelSize();
+    g_mapWnd = CreateWindowExA(
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE,
+        "KarvisMinimap", "KarvisMap", WS_POPUP,
+        20, 20, sz, sz, nullptr, nullptr, hInst, nullptr);
+    if (!g_mapWnd) {
+        Log("MAP: CreateWindow failed");
+        return 1;
+    }
+    // Magenta (255,0,255) color-keyed as fully transparent
+    SetLayeredWindowAttributes(g_mapWnd, RGB(255, 0, 255), (BYTE)g_settings.mapOpacity, LWA_COLORKEY | LWA_ALPHA);
+    PositionMapWindow();
+
+    MSG msg;
+    g_mapRunning = true;
+    ULONGLONG lastReposition = 0;
+    BYTE lastOpacity = (BYTE)g_settings.mapOpacity;
+    while (g_mapRunning) {
+        while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            if (msg.message == WM_QUIT) { g_mapRunning = false; break; }
+            TranslateMessage(&msg);
+            DispatchMessage(&msg);
+        }
+        ULONGLONG now = GetTickCount64();
+        if (now - lastReposition > 150) {
+            lastReposition = now;
+
+            // Tie minimap visibility to Minecraft: only show when MC is the active
+            // foreground window and we're in a world.
+            HWND game = FindGameWindow();
+            HWND fg = GetForegroundWindow();
+
+            bool mcAlive = game && IsWindow(game);
+            bool mcShown = mcAlive && IsWindowVisible(game) && !IsIconic(game);
+            bool mcForeground = mcAlive && (fg == game);
+            bool shouldShow = g_settings.mapEnabled && g_inGame && mcShown && mcForeground;
+
+            if (shouldShow) {
+                // Sync opacity if user changed the setting
+                BYTE o = (BYTE)g_settings.mapOpacity;
+                if (o != lastOpacity) {
+                    SetLayeredWindowAttributes(g_mapWnd, RGB(255, 0, 255), o, LWA_COLORKEY | LWA_ALPHA);
+                    lastOpacity = o;
+                }
+                if (!IsWindowVisible(g_mapWnd)) ShowWindow(g_mapWnd, SW_SHOWNOACTIVATE);
+                PositionMapWindow();
+            }
+            else {
+                if (IsWindowVisible(g_mapWnd)) ShowWindow(g_mapWnd, SW_HIDE);
+            }
+        }
+        Sleep(16);
+    }
+
+    if (g_mapWnd) { DestroyWindow(g_mapWnd); g_mapWnd = nullptr; }
+    if (g_mapFont) { DeleteObject(g_mapFont); g_mapFont = nullptr; }
+    if (g_mapFontBold) { DeleteObject(g_mapFontBold); g_mapFontBold = nullptr; }
+    return 0;
+}
+
+// ===================== MINIMAP DATA UPDATER =====================
+// Performance strategy:
+//   - Work persists between calls in a staging buffer; each call processes a
+//     small slice of rows (ROWS_PER_TICK) then returns control so the JNI
+//     worker thread doesn't freeze for hundreds of ms.
+//   - Top-down scan uses stride 4 first to find the approximate surface, then
+//     refines within a small window. ~5x fewer JNI calls vs the naive scan.
+//   - When the player moves, we recentre the grid and reuse overlapping
+//     samples (scrolling buffer) so only the newly exposed rows/columns must
+//     be resampled.
+
+static MapSample g_stagingSamples[TERRAIN_DIM * TERRAIN_DIM];
+static int  g_stagingCenterX = 0;
+static int  g_stagingCenterZ = 0;
+static bool g_stagingValid = false;
+static int  g_stagingRowCursor = 0;   // next row index to sample (0..TERRAIN_DIM-1)
+static bool g_stagingUnderground = false;
+static int  g_stagingCenterY = 64;
+
+static void SampleOneColumn(int bx, int bz, int centerY, bool underground, MapSample& out) {
+    out.color = RGB(24, 28, 36);
+    out.yTop = centerY;
+    out.flags = 0;
+
+    if (!underground) {
+        // Coarse scan: step 4 from y=255 down until we hit something solid
+        int approxY = -1;
+        for (int y = 255; y >= 0; y -= 4) {
+            uint8_t f;
+            int c = Java::GetBlockColorAt(bx, y, bz, f);
+            if (c < 0) continue;
+            int r = GetRValue((COLORREF)c), g = GetGValue((COLORREF)c), b = GetBValue((COLORREF)c);
+            if (r == 0 && g == 0 && b == 0) continue;
+            approxY = y;
+            break;
+        }
+        if (approxY < 0) return;
+
+        // Refine: scan up to +4 above approxY to find the actual top
+        int topY = approxY;
+        int topC = -1;
+        uint8_t topF = 0;
+        for (int y = approxY + 4; y >= approxY - 3 && y >= 0; y--) {
+            uint8_t f;
+            int c = Java::GetBlockColorAt(bx, y, bz, f);
+            if (c < 0) continue;
+            int r = GetRValue((COLORREF)c), g = GetGValue((COLORREF)c), b = GetBValue((COLORREF)c);
+            if (r == 0 && g == 0 && b == 0) continue;
+            topC = c; topY = y; topF = f;
+            break;
+        }
+        if (topC >= 0) {
+            out.color = (COLORREF)topC;
+            out.yTop = topY;
+            out.flags = topF;
+        }
+    }
+    else {
+        int best = -1, bestY = centerY;
+        uint8_t bestF = 0;
+        int scanLo = centerY - 8; if (scanLo < 0) scanLo = 0;
+        for (int y = centerY + 1; y >= scanLo; y--) {
+            uint8_t f;
+            int c = Java::GetBlockColorAt(bx, y, bz, f);
+            if (c < 0) continue;
+            int r = GetRValue((COLORREF)c), g = GetGValue((COLORREF)c), b = GetBValue((COLORREF)c);
+            bool solid = !(r == 0 && g == 0 && b == 0);
+            if (solid) {
+                best = c; bestY = y; bestF = f;
+                if (f & 1) break; // ore wins
+            }
+        }
+        if (best >= 0) {
+            out.color = (COLORREF)best;
+            out.yTop = bestY;
+            out.flags = bestF | 2;
+            if (bestY == centerY) out.flags |= 8;
+        }
+        else {
+            out.color = RGB(8, 9, 12);
+            out.yTop = centerY;
+            out.flags = 2;
+        }
+    }
+}
+
+static void UpdateMinimapData() {
+    if (!Java::env) return;
+
+    float px, py, pz, yaw;
+    if (!Java::GetPlayerPose(px, py, pz, yaw)) return;
+
+    int centerX = (int)floorf(px);
+    int centerZ = (int)floorf(pz);
+    int centerY = (int)floorf(py);
+
+    // (Re)detect underground state periodically. A 5-column scan (center +
+    // four NESW neighbors) handles ravines and caves with an open ceiling
+    // directly above the player. Threshold and Y cap are loose so caves at
+    // higher Y (e.g. mountain caves) still count as "underground" for the
+    // cave rendering mode.
+    static ULONGLONG lastUndergroundCheck = 0;
+    ULONGLONG now = GetTickCount64();
+    if (!g_stagingValid || now - lastUndergroundCheck > 1500) {
+        static const int OX[5] = { 0,  2, -2,  0,  0 };
+        static const int OZ[5] = { 0,  0,  0,  2, -2 };
+        int bestHits = 0;
+        for (int k = 0; k < 5; k++) {
+            int hits = 0;
+            for (int dy = 2; dy < 18; dy++) {
+                uint8_t f;
+                int c = Java::GetBlockColorAt(centerX + OX[k], centerY + dy, centerZ + OZ[k], f);
+                if (c >= 0) {
+                    int r = GetRValue((COLORREF)c), g = GetGValue((COLORREF)c), b = GetBValue((COLORREF)c);
+                    if (!(r == 0 && g == 0 && b == 0)) hits++;
+                }
+            }
+            if (hits > bestHits) bestHits = hits;
+        }
+        g_stagingUnderground = (bestHits >= 3) && (centerY < 80);
+        g_stagingCenterY = centerY;
+        lastUndergroundCheck = now;
+    }
+
+    // Scroll the staging buffer when player moved enough to shift grid origin
+    if (g_stagingValid) {
+        int dx = centerX - g_stagingCenterX;
+        int dz = centerZ - g_stagingCenterZ;
+        if (dx != 0 || dz != 0) {
+            // Shift samples; areas outside overlap get zeroed and re-sampled later
+            static MapSample shifted[TERRAIN_DIM * TERRAIN_DIM];
+            memset(shifted, 0, sizeof(shifted));
+            for (int z = 0; z < TERRAIN_DIM; z++) {
+                int srcZ = z + dz;
+                if (srcZ < 0 || srcZ >= TERRAIN_DIM) continue;
+                for (int x = 0; x < TERRAIN_DIM; x++) {
+                    int srcX = x + dx;
+                    if (srcX < 0 || srcX >= TERRAIN_DIM) continue;
+                    shifted[z * TERRAIN_DIM + x] = g_stagingSamples[srcZ * TERRAIN_DIM + srcX];
+                }
+            }
+            memcpy(g_stagingSamples, shifted, sizeof(shifted));
+            g_stagingCenterX = centerX;
+            g_stagingCenterZ = centerZ;
+            // Force re-sampling of edge rows first by resetting cursor
+            g_stagingRowCursor = 0;
+        }
+    }
+    else {
+        // Initial scan in progress: set the center ONCE and preserve
+        // g_stagingRowCursor across ticks so the first full pass can
+        // actually complete and flip g_stagingValid. Previously the
+        // cursor got reset to 0 every tick, so rows 8..127 were never
+        // sampled and the minimap was stuck on "Loading...".
+        static bool stagingInited = false;
+        if (!stagingInited) {
+            g_stagingCenterX = centerX;
+            g_stagingCenterZ = centerZ;
+            g_stagingRowCursor = 0;
+            stagingInited = true;
+        }
+    }
+
+    // Do a slice of rows this tick. Start with the rows closest to the player
+    // so the area around the arrow fills in first (feels faster). We walk an
+    // "inside-out" order: center row, center-1, center+1, center-2, center+2,
+    // etc., then wrap to far edges. This makes the nearby terrain appear
+    // almost immediately while the outskirts stream in behind it.
+    const int ROWS_PER_TICK = 20;
+    int half = TERRAIN_DIM / 2;
+    for (int rr = 0; rr < ROWS_PER_TICK; rr++) {
+        int step = g_stagingRowCursor;
+        int z;
+        if (step >= TERRAIN_DIM) { g_stagingRowCursor = 0; step = 0; }
+        // 0 -> half, 1 -> half-1, 2 -> half+1, 3 -> half-2, 4 -> half+2 ...
+        if (step == 0) z = half;
+        else {
+            int k = (step + 1) / 2;
+            z = (step & 1) ? (half - k) : (half + k);
+        }
+        if (z < 0 || z >= TERRAIN_DIM) { g_stagingRowCursor++; continue; }
+
+        int bz = centerZ + (z - half);
+        for (int x = 0; x < TERRAIN_DIM; x++) {
+            int bx = centerX + (x - half);
+            SampleOneColumn(bx, bz, centerY, g_stagingUnderground, g_stagingSamples[z * TERRAIN_DIM + x]);
+        }
+        g_stagingRowCursor++;
+        if (g_stagingRowCursor >= TERRAIN_DIM) {
+            g_stagingRowCursor = 0;
+            g_stagingValid = true; // first full pass completed -> buffer usable
+            break;
+        }
+    }
+
+    // Publish staging buffer into the renderable MapData every tick. We mark
+    // it valid as soon as the center row is populated so the player sees a
+    // small disc of terrain around themselves immediately, which then grows
+    // outward instead of the UI being frozen on "Loading..." for ~0.6s.
+    bool partialOK = g_stagingRowCursor >= 2 || g_stagingValid;
+    if (g_mapCSReady && partialOK) {
+        EnterCriticalSection(&g_mapCS);
+        memcpy(g_map.samples, g_stagingSamples, sizeof(g_stagingSamples));
+        g_map.centerBlockX = g_stagingCenterX;
+        g_map.centerBlockZ = g_stagingCenterZ;
+        g_map.playerX = px;
+        g_map.playerY = py;
+        g_map.playerZ = pz;
+        g_map.playerYaw = yaw;
+        g_map.underground = g_stagingUnderground;
+        g_map.valid = true;
+        g_map.lastUpdate = now;
+        LeaveCriticalSection(&g_mapCS);
+    }
+}
+
+// ===================== GUI =====================
+// Window / layout constants
+#define GUI_W          640
+#define GUI_H          540
+#define TITLE_H        54
+#define SIDEBAR_W      172
+#define FOOTER_H       38
+#define CONTENT_X      SIDEBAR_W
+#define CONTENT_Y      TITLE_H
+#define CONTENT_W      (GUI_W - SIDEBAR_W)
+#define CONTENT_H      (GUI_H - TITLE_H - FOOTER_H)
+#define ITEM_H         62
+#define ITEM_GAP       8
+#define ITEM_PAD_X     18
+#define SCROLL_W       6
+#define TAB_H          56
+#define TAB_TOP        (TITLE_H + 18)
+
+static bool g_guiVisible = true;
+static bool g_dragging = false;
+static POINT g_dragOffset;
+static HFONT g_fontTitle = nullptr;
+static HFONT g_fontItem = nullptr;
+static HFONT g_fontSmall = nullptr;
+static HFONT g_fontTiny = nullptr;
+static HFONT g_fontTab = nullptr;
+static HDC g_cachedDC = nullptr;
+static HBITMAP g_cachedBmp = nullptr;
+static int g_cachedW = 0, g_cachedH = 0;
+static int g_hoverItem = -1;
+static int g_hoverTab = -1;
+
+// Colors - refined darker palette with cyan/purple accent
+static const COLORREF C_BG = RGB(12, 14, 20);
+static const COLORREF C_TITLE_BG = RGB(16, 19, 28);
+static const COLORREF C_SIDEBAR_BG = RGB(10, 12, 18);
+static const COLORREF C_ITEM_BG = RGB(22, 26, 36);
+static const COLORREF C_ITEM_HOVER = RGB(32, 38, 54);
+static const COLORREF C_TAB_ACTIVE = RGB(26, 31, 44);
+static const COLORREF C_ACCENT = RGB(96, 195, 255);
+static const COLORREF C_ACCENT2 = RGB(148, 108, 255);
+static const COLORREF C_ON = RGB(80, 220, 130);
+static const COLORREF C_OFF = RGB(62, 42, 54);
+static const COLORREF C_TEXT = RGB(235, 238, 245);
+static const COLORREF C_DIM = RGB(135, 140, 160);
+static const COLORREF C_BORDER = RGB(48, 54, 74);
+static const COLORREF C_SCROLL = RGB(80, 110, 160);
+
+// Menu items
+struct MenuItem {
+    std::string name;
+    std::string description;
+    enum Type { TOGGLE, BUTTON, CYCLE, INFO } type;
+    void* valuePtr;                          // TOGGLE: bool*, CYCLE: int*
+    std::vector<std::string> cycleOptions;   // for CYCLE
+    int cycleMin = 0;
+    int cycleMax = 0;                        // inclusive max
+};
+
+// One list of items per tab
+static std::vector<MenuItem> g_tabItems[2];
+
+static const char* g_tabNames[2] = { "General", "Minimap" };
+static const char* g_tabSubtitles[2] = { "Gameplay helpers", "World minimap" };
+
+static MenuItem MakeToggle(const char* n, const char* d, bool* v) {
+    MenuItem it; it.type = MenuItem::TOGGLE; it.name = n; it.description = d; it.valuePtr = v; return it;
+}
+static MenuItem MakeButton(const char* n, const char* d) {
+    MenuItem it; it.type = MenuItem::BUTTON; it.name = n; it.description = d; it.valuePtr = nullptr; return it;
+}
+static MenuItem MakeCycle(const char* n, const char* d, void* v, std::vector<std::string> opts, int lo, int hi) {
+    MenuItem it; it.type = MenuItem::CYCLE; it.name = n; it.description = d;
+    it.valuePtr = v; it.cycleOptions = std::move(opts); it.cycleMin = lo; it.cycleMax = hi; return it;
+}
+
+void InitMenuItems() {
+    for (int i = 0; i < 2; i++) g_tabItems[i].clear();
+
+    // ---------- General ----------
+    g_tabItems[0].push_back(MakeToggle("No Jump Delay", "Remove the cooldown between jumps", &g_settings.noJumpDelay));
+    g_tabItems[0].push_back(MakeToggle("No Hit Delay", "Remove the attack cooldown (instant hits)", &g_settings.noHitDelay));
+    g_tabItems[0].push_back(MakeToggle("Mouse Delay Fix", "Disable Windows mouse accel / enhance pointer precision", &g_settings.mouseDelayFix));
+    g_tabItems[0].push_back(MakeToggle("Show Player HP", "Red hearts + gold absorption above players in-game", &g_settings.espShowHP));
+    g_tabItems[0].push_back(MakeButton("Change Nick", "Set a custom client-side nickname"));
+
+    // ---------- Minimap ----------
+    g_tabItems[1].push_back(MakeToggle("Enable Minimap", "Show the world minimap overlay", &g_settings.mapEnabled));
+    g_tabItems[1].push_back(MakeCycle("Position", "Which screen corner the minimap uses",
+        &g_settings.mapCorner, { "Top Right", "Top Left", "Bot Right", "Bot Left" }, 0, 3));
+    g_tabItems[1].push_back(MakeCycle("Size", "On-screen size of the minimap",
+        &g_settings.mapSize, { "Small", "Medium", "Large", "X-Large", "XX-Large", "Huge" }, 0, 5));
+    g_tabItems[1].push_back(MakeCycle("Shape", "Round or Square frame",
+        nullptr /* special */, { "Round", "Square" }, 0, 1));
+    g_tabItems[1].push_back(MakeCycle("Zoom", "Detail level / world radius",
+        &g_settings.mapZoom, { "", "1x", "2x", "3x", "4x", "5x" }, 1, 5));
+    g_tabItems[1].push_back(MakeCycle("Opacity", "Transparency of the minimap window",
+        nullptr /* special */, { "50%", "75%", "90%", "100%" }, 0, 3));
+    g_tabItems[1].push_back(MakeToggle("Show Entities", "Players, mobs and items", &g_settings.mapShowEntities));
+    g_tabItems[1].push_back(MakeToggle("Show Player Heads", "Render players as pixel heads", &g_settings.mapShowHeads));
+    g_tabItems[1].push_back(MakeToggle("Show Names", "Draw name tags under heads", &g_settings.mapShowNames));
+    g_tabItems[1].push_back(MakeToggle("Highlight Ores", "Brighten ores in cave mode", &g_settings.mapShowOres));
+}
+
+void FillRoundRect(HDC h, int x, int y, int w, int hh, int r, COLORREF c) {
+    HBRUSH b = CreateSolidBrush(c);
+    HPEN p = CreatePen(PS_SOLID, 1, c);
+    HBRUSH ob = (HBRUSH)SelectObject(h, b);
+    HPEN op = (HPEN)SelectObject(h, p);
+    RoundRect(h, x, y, x + w, y + hh, r, r);
+    SelectObject(h, ob);
+    SelectObject(h, op);
+    DeleteObject(b);
+    DeleteObject(p);
+}
+
+static int OpacityValueToIndex(int v) {
+    if (v <= 150) return 0;
+    if (v <= 205) return 1;
+    if (v <= 240) return 2;
+    return 3;
+}
+static int OpacityIndexToValue(int i) {
+    static const int tbl[4] = { 127, 190, 229, 255 };
+    if (i < 0) i = 0; if (i > 3) i = 3;
+    return tbl[i];
+}
+
+static int CycleGetValue(const MenuItem& it) {
+    if (it.name == "Shape")   return g_settings.mapRound ? 0 : 1;
+    if (it.name == "Opacity") return OpacityValueToIndex(g_settings.mapOpacity);
+    if (it.valuePtr)          return *((int*)it.valuePtr);
+    return 0;
+}
+static void CycleSetValue(MenuItem& it, int v) {
+    if (it.name == "Shape") { g_settings.mapRound = (v == 0); return; }
+    if (it.name == "Opacity") { g_settings.mapOpacity = OpacityIndexToValue(v); return; }
+    if (it.valuePtr)            *((int*)it.valuePtr) = v;
+}
+static void CycleAdvance(MenuItem& it, int dir) {
+    int v = CycleGetValue(it);
+    int lo = it.cycleMin, hi = it.cycleMax;
+    v += dir;
+    if (v > hi) v = lo;
+    if (v < lo) v = hi;
+    CycleSetValue(it, v);
+}
+
+// Compute total vertical content height for a given tab (for scroll clamping).
+static int TabContentHeight(int tab) {
+    int n = (int)g_tabItems[tab].size();
+    if (n == 0) return 0;
+    return 14 /*top pad*/ + n * ITEM_H + (n - 1) * ITEM_GAP + 14 /*bot pad*/;
+}
+static int MaxScrollForTab(int tab) {
+    int h = TabContentHeight(tab) - CONTENT_H;
+    return h > 0 ? h : 0;
+}
+
+// ---------------------------------------------------------------------------
+// Hit testing helpers
+//
+// Layout:
+//   - Title bar:    0 .. TITLE_H
+//   - Sidebar:      x 0 .. SIDEBAR_W, y TITLE_H .. (h - FOOTER_H)
+//   - Content area: x SIDEBAR_W .. w, y TITLE_H .. (h - FOOTER_H)
+//   - Footer:       y (h - FOOTER_H) .. h
+// ---------------------------------------------------------------------------
+
+static int HitTestTab(int mx, int my, int w, int h) {
+    (void)w; (void)h;
+    if (mx < 0 || mx >= SIDEBAR_W) return -1;
+    for (int t = 0; t < 2; t++) {
+        int ty = TAB_TOP + t * (TAB_H + 6);
+        if (my >= ty && my < ty + TAB_H) return t;
+    }
+    return -1;
+}
+
+// Returns the index of the item under (mx,my) accounting for scroll.
+// Also returns -2 if the cursor is inside the content area but not on an item.
+static int HitTestContentItem(int mx, int my, int w, int h) {
+    if (mx < SIDEBAR_W || mx >= w - SCROLL_W - 2) return -1;
+    if (my < TITLE_H || my >= h - FOOTER_H) return -1;
+
+    int scroll = g_scrollOffset[g_currentTab];
+    int itemY = TITLE_H + 14 - scroll;               // top pad = 14
+    const auto& items = g_tabItems[g_currentTab];
+    for (int i = 0; i < (int)items.size(); i++) {
+        if (my >= itemY && my < itemY + ITEM_H) {
+            // Ensure hit is within visible content region
+            if (itemY + ITEM_H <= TITLE_H || itemY >= h - FOOTER_H) return -2;
+            return i;
+        }
+        itemY += ITEM_H + ITEM_GAP;
+    }
+    return -2;
+}
+
+static void ClampScroll() {
+    int mx = MaxScrollForTab(g_currentTab);
+    if (g_scrollOffset[g_currentTab] < 0) g_scrollOffset[g_currentTab] = 0;
+    if (g_scrollOffset[g_currentTab] > mx) g_scrollOffset[g_currentTab] = mx;
+}
+
+// ---------------------------------------------------------------------------
+// Drawing helpers
+// ---------------------------------------------------------------------------
+
+static void DrawTitleBar(HDC mem, int w) {
+    // Solid title background
+    RECT tR = { 0, 0, w, TITLE_H };
+    HBRUSH b = CreateSolidBrush(C_TITLE_BG);
+    FillRect(mem, &tR, b);
+    DeleteObject(b);
+
+    // Gradient accent bar at bottom
+    TRIVERTEX v[2];
+    GRADIENT_RECT gr = { 0, 1 };
+    v[0].x = 0; v[0].y = TITLE_H - 3;
+    v[0].Red = GetRValue(C_ACCENT) << 8;
+    v[0].Green = GetGValue(C_ACCENT) << 8;
+    v[0].Blue = GetBValue(C_ACCENT) << 8;
+    v[0].Alpha = 0xFF00;
+    v[1].x = w; v[1].y = TITLE_H;
+    v[1].Red = GetRValue(C_ACCENT2) << 8;
+    v[1].Green = GetGValue(C_ACCENT2) << 8;
+    v[1].Blue = GetBValue(C_ACCENT2) << 8;
+    v[1].Alpha = 0xFF00;
+    GradientFill(mem, v, 2, &gr, 1, GRADIENT_FILL_RECT_H);
+
+    // Brand mark: colored square + title
+    SetBkMode(mem, TRANSPARENT);
+
+    FillRoundRect(mem, 18, (TITLE_H - 22) / 2, 22, 22, 5, C_ACCENT);
+    SetTextColor(mem, RGB(10, 14, 22));
+    SelectObject(mem, g_fontTiny);
+    RECT kR = { 18, (TITLE_H - 22) / 2, 40, (TITLE_H - 22) / 2 + 22 };
+    DrawTextA(mem, "K", -1, &kR, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+
+    SelectObject(mem, g_fontTitle);
+    SetTextColor(mem, C_TEXT);
+    RECT titleR = { 52, 0, w - 60, TITLE_H };
+    DrawTextA(mem, "Karvis Files", -1, &titleR, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+
+    // Version pill
+    SelectObject(mem, g_fontTiny);
+    SIZE ts; GetTextExtentPoint32A(mem, "v1", 2, &ts);
+    int pillW = ts.cx + 14, pillH = 18;
+    int pillX = 52 + 120, pillY = (TITLE_H - pillH) / 2;
+    FillRoundRect(mem, pillX, pillY, pillW, pillH, 9, RGB(30, 40, 60));
+    SetTextColor(mem, C_ACCENT);
+    RECT pillR = { pillX, pillY, pillX + pillW, pillY + pillH };
+    DrawTextA(mem, "v1", -1, &pillR, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+}
+
+static void DrawCloseButton(HDC mem, int w) {
+    int closeX = w - 40, closeY = 14, closeSz = 26;
+    FillRoundRect(mem, closeX, closeY, closeSz, closeSz, 6, RGB(142, 50, 60));
+    SetTextColor(mem, C_TEXT);
+    SelectObject(mem, g_fontItem);
+    RECT closeR = { closeX, closeY, closeX + closeSz, closeY + closeSz };
+    SetBkMode(mem, TRANSPARENT);
+    DrawTextA(mem, "X", -1, &closeR, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+}
+
+static void DrawSidebar(HDC mem, int w, int h) {
+    // Sidebar background (slightly darker than main bg)
+    RECT sR = { 0, TITLE_H, SIDEBAR_W, h - FOOTER_H };
+    HBRUSH b = CreateSolidBrush(C_SIDEBAR_BG);
+    FillRect(mem, &sR, b);
+    DeleteObject(b);
+
+    // Right divider line
+    HPEN pn = CreatePen(PS_SOLID, 1, C_BORDER);
+    HPEN op = (HPEN)SelectObject(mem, pn);
+    MoveToEx(mem, SIDEBAR_W - 1, TITLE_H, nullptr);
+    LineTo(mem, SIDEBAR_W - 1, h - FOOTER_H);
+    SelectObject(mem, op);
+    DeleteObject(pn);
+
+    // Tabs
+    SetBkMode(mem, TRANSPARENT);
+    for (int t = 0; t < 2; t++) {
+        int ty = TAB_TOP + t * (TAB_H + 6);
+        bool active = (t == g_currentTab);
+        bool hover = (t == g_hoverTab && !active);
+
+        if (active) {
+            FillRoundRect(mem, 8, ty, SIDEBAR_W - 16, TAB_H, 8, C_TAB_ACTIVE);
+            // Left accent stripe
+            HBRUSH accBr = CreateSolidBrush(C_ACCENT);
+            RECT aR = { 8, ty + 8, 12, ty + TAB_H - 8 };
+            FillRect(mem, &aR, accBr);
+            DeleteObject(accBr);
+        }
+        else if (hover) {
+            FillRoundRect(mem, 8, ty, SIDEBAR_W - 16, TAB_H, 8, RGB(18, 22, 32));
+        }
+
+        SelectObject(mem, g_fontTab);
+        SetTextColor(mem, active ? C_TEXT : C_DIM);
+        RECT nR = { 20, ty + 8, SIDEBAR_W - 12, ty + 30 };
+        DrawTextA(mem, g_tabNames[t], -1, &nR, DT_LEFT | DT_SINGLELINE | DT_TOP);
+
+        SelectObject(mem, g_fontSmall);
+        SetTextColor(mem, active ? C_ACCENT : RGB(90, 96, 115));
+        RECT sbR = { 20, ty + 30, SIDEBAR_W - 12, ty + TAB_H - 6 };
+        DrawTextA(mem, g_tabSubtitles[t], -1, &sbR, DT_LEFT | DT_SINGLELINE | DT_TOP);
+    }
+}
+
+static void DrawContentItems(HDC mem, int w, int h) {
+    const auto& items = g_tabItems[g_currentTab];
+    int scroll = g_scrollOffset[g_currentTab];
+
+    // Clip region so scrolling items never bleed into title/footer
+    HRGN clip = CreateRectRgn(SIDEBAR_W + 1, TITLE_H, w, h - FOOTER_H);
+    SelectClipRgn(mem, clip);
+
+    int baseX = SIDEBAR_W + ITEM_PAD_X;
+    int itemWidth = w - SIDEBAR_W - ITEM_PAD_X * 2 - SCROLL_W - 4;
+    int itemY = TITLE_H + 14 - scroll;
+
+    SetBkMode(mem, TRANSPARENT);
+
+    for (int i = 0; i < (int)items.size(); i++) {
+        // Skip items entirely outside the visible region
+        if (itemY + ITEM_H >= TITLE_H && itemY < h - FOOTER_H) {
+            const auto& item = items[i];
+            bool hover = (i == g_hoverItem);
+
+            FillRoundRect(mem, baseX, itemY, itemWidth, ITEM_H, 10, hover ? C_ITEM_HOVER : C_ITEM_BG);
+
+            // Left accent strip when "lit"
+            bool lit = false;
+            if (item.type == MenuItem::TOGGLE && item.valuePtr) lit = *((bool*)item.valuePtr);
+            if (item.type == MenuItem::CYCLE)  lit = true;
+            if (item.type == MenuItem::BUTTON) lit = (item.name == "Change Nick" && g_settings.nickname[0] != '\0');
+            if (lit) {
+                HBRUSH ab = CreateSolidBrush(C_ACCENT);
+                RECT ar = { baseX + 2, itemY + 8, baseX + 5, itemY + ITEM_H - 8 };
+                FillRect(mem, &ar, ab);
+                DeleteObject(ab);
+            }
+
+            // Name
+            SetTextColor(mem, C_TEXT);
+            SelectObject(mem, g_fontItem);
+            RECT nameR = { baseX + 16, itemY + 10, baseX + itemWidth - 150, itemY + 30 };
+            DrawTextA(mem, item.name.c_str(), -1, &nameR, DT_LEFT | DT_SINGLELINE | DT_TOP);
+
+            // Description
+            SetTextColor(mem, C_DIM);
+            SelectObject(mem, g_fontSmall);
+            RECT descR = { baseX + 16, itemY + 32, baseX + itemWidth - 150, itemY + ITEM_H - 4 };
+            DrawTextA(mem, item.description.c_str(), -1, &descR, DT_LEFT | DT_SINGLELINE | DT_TOP);
+
+            // Control on the right
+            if (item.type == MenuItem::TOGGLE) {
+                bool on = *((bool*)item.valuePtr);
+                int swW = 50, swH = 26;
+                int swX = baseX + itemWidth - 14 - swW;
+                int swY = itemY + (ITEM_H - swH) / 2;
+
+                FillRoundRect(mem, swX, swY, swW, swH, 13, on ? C_ON : C_OFF);
+                int circleX = on ? swX + swW - swH + 3 : swX + 3;
+                FillRoundRect(mem, circleX, swY + 3, swH - 6, swH - 6, 10, RGB(250, 252, 255));
+            }
+            else if (item.type == MenuItem::BUTTON) {
+                int btnW = 110, btnH = 32;
+                int btnX = baseX + itemWidth - 14 - btnW;
+                int btnY = itemY + (ITEM_H - btnH) / 2;
+
+                FillRoundRect(mem, btnX, btnY, btnW, btnH, 8, C_ACCENT);
+                SetTextColor(mem, RGB(10, 14, 22));
+                SelectObject(mem, g_fontSmall);
+                RECT btnR = { btnX, btnY, btnX + btnW, btnY + btnH };
+
+                std::string btnText;
+                if (item.name == "Change Nick" && g_settings.nickname[0] != '\0') {
+                    btnText = std::string(g_settings.nickname);
+                    if (btnText.length() > 12) btnText = btnText.substr(0, 11) + "..";
+                }
+                else if (item.name == "Change Nick") { btnText = "Set Nick"; }
+                else btnText = "Click";
+                DrawTextA(mem, btnText.c_str(), -1, &btnR, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+            }
+            else if (item.type == MenuItem::CYCLE) {
+                int v = CycleGetValue(item);
+                std::string label = "?";
+                if (v >= 0 && v < (int)item.cycleOptions.size()) label = item.cycleOptions[v];
+
+                int cW = 150, cH = 32;
+                int cX = baseX + itemWidth - 14 - cW;
+                int cY = itemY + (ITEM_H - cH) / 2;
+                FillRoundRect(mem, cX, cY, cW, cH, 8, RGB(30, 36, 52));
+
+                // chevrons
+                SelectObject(mem, g_fontItem);
+                SetTextColor(mem, C_ACCENT);
+                RECT lArrow = { cX + 4, cY, cX + 22, cY + cH };
+                DrawTextA(mem, "<", -1, &lArrow, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+                RECT rArrow = { cX + cW - 22, cY, cX + cW - 4, cY + cH };
+                DrawTextA(mem, ">", -1, &rArrow, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+
+                SelectObject(mem, g_fontSmall);
+                SetTextColor(mem, C_TEXT);
+                RECT lblR = { cX + 22, cY, cX + cW - 22, cY + cH };
+                DrawTextA(mem, label.c_str(), -1, &lblR, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+            }
+        }
+        itemY += ITEM_H + ITEM_GAP;
+    }
+
+    SelectClipRgn(mem, nullptr);
+    DeleteObject(clip);
+
+    // Scrollbar indicator on right edge of content area
+    int totalH = TabContentHeight(g_currentTab);
+    int visibleH = CONTENT_H;
+    if (totalH > visibleH) {
+        int trackX = w - SCROLL_W - 4;
+        int trackY = TITLE_H + 8;
+        int trackH = h - FOOTER_H - TITLE_H - 16;
+
+        // Track
+        HBRUSH tb = CreateSolidBrush(RGB(20, 24, 34));
+        RECT tR = { trackX, trackY, trackX + SCROLL_W, trackY + trackH };
+        FillRect(mem, &tR, tb);
+        DeleteObject(tb);
+
+        // Thumb
+        int thumbH = (visibleH * trackH) / totalH;
+        if (thumbH < 24) thumbH = 24;
+        int thumbY = trackY + ((scroll * (trackH - thumbH)) / (totalH - visibleH));
+        FillRoundRect(mem, trackX, thumbY, SCROLL_W, thumbH, SCROLL_W / 2, C_SCROLL);
+    }
+}
+
+static void DrawFooter(HDC mem, int w, int h) {
+    int fy = h - FOOTER_H;
+
+    // Top divider
+    HPEN pn = CreatePen(PS_SOLID, 1, C_BORDER);
+    HPEN op = (HPEN)SelectObject(mem, pn);
+    MoveToEx(mem, 0, fy, nullptr);
+    LineTo(mem, w, fy);
+    SelectObject(mem, op);
+    DeleteObject(pn);
+
+    SetBkMode(mem, TRANSPARENT);
+
+    // Status LED dot (green if running, yellow if initializing)
+    bool ok = (strstr(g_debugStatus, "Ready") != nullptr);
+    COLORREF dot = ok ? RGB(80, 220, 130) : RGB(230, 190, 60);
+    HBRUSH db = CreateSolidBrush(dot);
+    int dotX = 18, dotY = fy + FOOTER_H / 2 - 4;
+    Ellipse(mem, dotX, dotY, dotX + 8, dotY + 8);
+    DeleteObject(db);
+
+    SelectObject(mem, g_fontSmall);
+    SetTextColor(mem, C_DIM);
+    RECT sR = { dotX + 14, fy, w / 2, h };
+    DrawTextA(mem, g_debugStatus, -1, &sR, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+
+    // Hotkey hint on right
+    SetTextColor(mem, RGB(96, 102, 124));
+    RECT kR = { w / 2, fy, w - 16, h };
+    DrawTextA(mem, "SHIFT+ALT  toggle    DEL  unload    F11  borderless",
+        -1, &kR, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
+}
+
+LRESULT CALLBACK GuiWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+    case WM_CREATE:
+        SetTimer(hWnd, 1, 300, nullptr);
+        return 0;
+
+    case WM_TIMER:
+        InvalidateRect(hWnd, nullptr, FALSE);
+        return 0;
+
+    case WM_ERASEBKGND:
+        return TRUE;
+
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hWnd, &ps);
+        RECT cr;
+        GetClientRect(hWnd, &cr);
+        int w = cr.right, h = cr.bottom;
+
+        if (!g_cachedDC || w != g_cachedW || h != g_cachedH) {
+            if (g_cachedBmp) DeleteObject(g_cachedBmp);
+            if (g_cachedDC) DeleteDC(g_cachedDC);
+            g_cachedDC = CreateCompatibleDC(hdc);
+            g_cachedBmp = CreateCompatibleBitmap(hdc, w, h);
+            SelectObject(g_cachedDC, g_cachedBmp);
+            g_cachedW = w;
+            g_cachedH = h;
+        }
+
+        HDC mem = g_cachedDC;
+
+        // Background
+        HBRUSH bgBr = CreateSolidBrush(C_BG);
+        FillRect(mem, &cr, bgBr);
+        DeleteObject(bgBr);
+
+        DrawTitleBar(mem, w);
+        DrawCloseButton(mem, w);
+        DrawSidebar(mem, w, h);
+
+        DrawContentItems(mem, w, h);
+
+        DrawFooter(mem, w, h);
+
+        // Outer rounded border
+        HPEN borderPen = CreatePen(PS_SOLID, 1, C_BORDER);
+        HPEN oldBP = (HPEN)SelectObject(mem, borderPen);
+        HBRUSH oldBB = (HBRUSH)SelectObject(mem, GetStockObject(NULL_BRUSH));
+        RoundRect(mem, 0, 0, w, h, 12, 12);
+        SelectObject(mem, oldBP);
+        SelectObject(mem, oldBB);
+        DeleteObject(borderPen);
+
+        BitBlt(hdc, 0, 0, w, h, mem, 0, 0, SRCCOPY);
+        EndPaint(hWnd, &ps);
+        return 0;
+    }
+
+    case WM_LBUTTONDOWN: {
+        int mx = GET_X_LPARAM(lParam), my = GET_Y_LPARAM(lParam);
+        RECT cr;
+        GetClientRect(hWnd, &cr);
+        int w = cr.right, h = cr.bottom;
+
+        // Close button
+        int closeX = w - 40, closeY = 14, closeSz = 26;
+        if (mx >= closeX && mx < closeX + closeSz && my >= closeY && my < closeY + closeSz) {
+            ShowWindow(hWnd, SW_HIDE);
+            return 0;
+        }
+
+        // Title bar drag
+        if (my < TITLE_H) {
+            g_dragging = true;
+            POINT pt; GetCursorPos(&pt);
+            RECT wr; GetWindowRect(hWnd, &wr);
+            g_dragOffset = { pt.x - wr.left, pt.y - wr.top };
+            SetCapture(hWnd);
+            return 0;
+        }
+
+        // Sidebar tab click
+        int tab = HitTestTab(mx, my, w, h);
+        if (tab >= 0) {
+            if (tab != g_currentTab) {
+                g_currentTab = tab;
+                g_hoverItem = -1;
+                ClampScroll();
+                InvalidateRect(hWnd, nullptr, FALSE);
+            }
+            return 0;
+        }
+
+        // Content item click
+        int idx = HitTestContentItem(mx, my, w, h);
+        if (idx >= 0) {
+            auto& item = g_tabItems[g_currentTab][idx];
+            int scroll = g_scrollOffset[g_currentTab];
+            int itemY = TITLE_H + 14 - scroll + idx * (ITEM_H + ITEM_GAP);
+            int baseX = SIDEBAR_W + ITEM_PAD_X;
+            int itemWidth = w - SIDEBAR_W - ITEM_PAD_X * 2 - SCROLL_W - 4;
+
+            if (item.type == MenuItem::TOGGLE) {
+                bool* p = (bool*)item.valuePtr;
+                if (p) *p = !(*p);
+            }
+            else if (item.type == MenuItem::BUTTON) {
+                if (item.name == "Change Nick") {
+                    OpenNickDialog((HINSTANCE)GetWindowLongPtrA(hWnd, GWLP_HINSTANCE));
+                }
+            }
+            else if (item.type == MenuItem::CYCLE) {
+                int cW = 150, cH = 32;
+                int cX = baseX + itemWidth - 14 - cW;
+                int cY = itemY + (ITEM_H - cH) / 2;
+                if (mx >= cX && mx < cX + cW && my >= cY && my < cY + cH) {
+                    bool leftHalf = mx < cX + cW / 2;
+                    CycleAdvance(item, leftHalf ? -1 : 1);
+                }
+                else {
+                    CycleAdvance(item, 1);
+                }
+            }
+            InvalidateRect(hWnd, nullptr, FALSE);
+        }
+        return 0;
+    }
+
+    case WM_LBUTTONUP:
+        if (g_dragging) {
+            g_dragging = false;
+            ReleaseCapture();
+        }
+        return 0;
+
+    case WM_MOUSEMOVE: {
+        if (g_dragging) {
+            POINT pt; GetCursorPos(&pt);
+            SetWindowPos(hWnd, nullptr, pt.x - g_dragOffset.x, pt.y - g_dragOffset.y, 0, 0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            return 0;
+        }
+
+        int mx = GET_X_LPARAM(lParam), my = GET_Y_LPARAM(lParam);
+        RECT cr; GetClientRect(hWnd, &cr);
+        int w = cr.right, h = cr.bottom;
+
+        int newTab = HitTestTab(mx, my, w, h);
+        int newItem = HitTestContentItem(mx, my, w, h);
+        if (newItem < 0) newItem = -1;
+
+        if (newTab != g_hoverTab || newItem != g_hoverItem) {
+            g_hoverTab = newTab;
+            g_hoverItem = newItem;
+            InvalidateRect(hWnd, nullptr, FALSE);
+        }
+
+        TRACKMOUSEEVENT tme = { sizeof(tme), TME_LEAVE, hWnd, 0 };
+        TrackMouseEvent(&tme);
+        return 0;
+    }
+
+    case WM_MOUSEWHEEL: {
+        short delta = GET_WHEEL_DELTA_WPARAM(wParam);
+        // Scroll only when cursor is over content region
+        POINT pt; pt.x = GET_X_LPARAM(lParam); pt.y = GET_Y_LPARAM(lParam);
+        ScreenToClient(hWnd, &pt);
+        RECT cr; GetClientRect(hWnd, &cr);
+        int w = cr.right, h = cr.bottom;
+        bool inContent = (pt.x >= SIDEBAR_W && pt.x < w && pt.y >= TITLE_H && pt.y < h - FOOTER_H);
+        if (inContent) {
+            int step = (delta > 0 ? -1 : 1) * 48;
+            g_scrollOffset[g_currentTab] += step;
+            ClampScroll();
+            InvalidateRect(hWnd, nullptr, FALSE);
+        }
+        return 0;
+    }
+
+    case WM_MOUSELEAVE:
+        if (g_hoverItem != -1 || g_hoverTab != -1) {
+            g_hoverItem = -1;
+            g_hoverTab = -1;
+            InvalidateRect(hWnd, nullptr, FALSE);
+        }
+        return 0;
+
+    case WM_MOUSEACTIVATE:
+        return MA_NOACTIVATE;
+
+    case WM_SYSCOMMAND:
+        if ((wParam & 0xFFF0) == SC_MINIMIZE) {
+            ShowWindow(hWnd, SW_HIDE);
+            return 0;
+        }
+        return DefWindowProc(hWnd, msg, wParam, lParam);
+
+    case WM_CLOSE:
+        ShowWindow(hWnd, SW_HIDE);
+        return 0;
+
+    case WM_DESTROY:
+        KillTimer(hWnd, 1);
+        if (g_cachedBmp) { DeleteObject(g_cachedBmp); g_cachedBmp = nullptr; }
+        if (g_cachedDC) { DeleteDC(g_cachedDC);      g_cachedDC = nullptr; }
+        g_cachedW = 0;
+        g_cachedH = 0;
+        PostQuitMessage(0);
+        return 0;
+    }
+
+    return DefWindowProc(hWnd, msg, wParam, lParam);
+}
+
+bool CreateGuiWindow(HINSTANCE hInst) {
+    g_fontTitle = CreateFontA(22, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, "Segoe UI");
+    g_fontItem = CreateFontA(15, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, "Segoe UI");
+    g_fontSmall = CreateFontA(12, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, "Segoe UI");
+    g_fontTiny = CreateFontA(11, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, "Segoe UI");
+
+    WNDCLASSEXA wc = {
+        sizeof(wc), CS_HREDRAW | CS_VREDRAW, GuiWndProc, 0, 0, hInst, 0,
+        LoadCursor(nullptr, IDC_ARROW), CreateSolidBrush(C_BG), 0, "KarvisFilesGui", 0
+    };
+
+    if (!RegisterClassExA(&wc)) return false;
+
+    InitMenuItems();
+
+    int screenW = GetSystemMetrics(SM_CXSCREEN);
+    int screenH = GetSystemMetrics(SM_CYSCREEN);
+    int posX = (screenW - GUI_W) / 2;
+    int posY = (screenH - GUI_H) / 2;
+
+    g_hWnd = CreateWindowExA(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+        "KarvisFilesGui", "Karvis Files v1", WS_POPUP,
+        posX, posY, GUI_W, GUI_H, 0, 0, hInst, 0);
+
+    if (!g_hWnd) return false;
+    ShowWindow(g_hWnd, SW_SHOWNOACTIVATE);
+    UpdateWindow(g_hWnd);
+    g_guiVisible = true;
+    return true;
+}
+
+// ===================== HOOK THREAD =====================
+DWORD WINAPI MouseHookThread(LPVOID param) {
+    g_mouseHook = SetWindowsHookExA(WH_MOUSE_LL, LowLevelMouseProc, (HINSTANCE)(HMODULE)param, 0);
+    g_keyboardHook = SetWindowsHookExA(WH_KEYBOARD_LL, LowLevelKeyboardProc, (HINSTANCE)(HMODULE)param, 0);
+    if (!g_mouseHook) return 1;
+    MSG msg;
+    while (GetMessage(&msg, nullptr, 0, 0) > 0) {
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+    }
+    if (g_mouseHook) { UnhookWindowsHookEx(g_mouseHook); g_mouseHook = nullptr; }
+    if (g_keyboardHook) { UnhookWindowsHookEx(g_keyboardHook); g_keyboardHook = nullptr; }
+    return 0;
+}
+
+// ===================== NICKNAME APPLY =====================
+static void ApplyPendingNickname() {
+    if (strlen(g_pendingNick) < 3) {
+        snprintf(g_debugStatus, sizeof(g_debugStatus), "Nick too short (min 3 chars)");
+        return;
+    }
+    if (!Java::env) {
+        snprintf(g_debugStatus, sizeof(g_debugStatus), "Waiting for JNI init...");
+        g_nickApplyPending = true;
+        return;
+    }
+    if (!Java::field_session || !Java::field_sessionUsername) {
+        snprintf(g_debugStatus, sizeof(g_debugStatus), "Session not found - try later");
+        return;
+    }
+    bool ok = Java::SetNickname(std::string(g_pendingNick));
+    if (ok) {
+        snprintf(g_debugStatus, sizeof(g_debugStatus), "Nick: %s (reconnect to apply)", g_pendingNick);
+        strncpy_s(g_settings.nickname, g_pendingNick, sizeof(g_settings.nickname) - 1);
+    }
+    else {
+        snprintf(g_debugStatus, sizeof(g_debugStatus), "Nick change error - try again");
+    }
+}
+
+// ===================== SEH WRAPPERS =====================
+// __try/__except cannot coexist with C++ objects that require unwinding in the
+// same function, so we keep the SEH blocks in their own thin helpers.
+
+static bool SafeIsInWorld() {
+    __try { return Java::IsInWorld(); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+static void SafeApplyPendingNickname() {
+    __try { ApplyPendingNickname(); }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        snprintf(g_debugStatus, sizeof(g_debugStatus), "Nick change CRASHED");
+    }
+}
+
+static bool SafeApplyDelayPatches(bool jump, bool hit) {
+    __try {
+        if (jump) Java::ApplyNoJumpDelay();
+        if (hit)  Java::ApplyNoHitDelay();
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+static void SafeEnumerateEntitiesRaw(void* outVec, float px, float pz) {
+    __try {
+        Java::EnumerateEntities(*reinterpret_cast<std::vector<MapEntity>*>(outVec), px, pz);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+static void SafeUpdateMinimapData() {
+    __try { UpdateMinimapData(); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { Log("UpdateMinimapData crashed"); }
+}
+
+// ===================== MOUSE DELAY FIX =====================
+// Disables Windows "Enhance pointer precision" (mouse acceleration) WITHOUT
+// touching mouse speed. Speed = 10 is the neutral sensitivity value, but
+// writing it blindly changes the feel / effective DPI for users that run
+// anywhere else - so we leave SPI_MOUSESPEED alone entirely. We also only
+// apply the fix while Minecraft is the foreground window, and restore it the
+// instant the user alt-tabs out, so desktop / other apps keep their normal
+// pointer behavior.
+static bool g_mouseFixApplied = false;
+static int  g_savedMouseParams[3] = { 6, 10, 1 };
+
+static void ApplyMouseDelayFix() {
+    if (g_mouseFixApplied) return;
+    int cur[3] = { 0, 0, 0 };
+    if (SystemParametersInfoA(SPI_GETMOUSE, 0, cur, 0)) {
+        g_savedMouseParams[0] = cur[0];
+        g_savedMouseParams[1] = cur[1];
+        g_savedMouseParams[2] = cur[2];
+    }
+    // threshold1, threshold2, acceleration flag. All zero = "Enhance pointer
+    // precision" fully disabled. Speed is intentionally left untouched so the
+    // user's DPI / sensitivity feel is preserved.
+    int noAccel[3] = { 0, 0, 0 };
+    SystemParametersInfoA(SPI_SETMOUSE, 0, noAccel, SPIF_SENDCHANGE);
+    g_mouseFixApplied = true;
+    Log("Mouse delay fix: applied (accel OFF, speed untouched)");
+}
+
+static void RestoreMouseDelayFix() {
+    if (!g_mouseFixApplied) return;
+    SystemParametersInfoA(SPI_SETMOUSE, 0, g_savedMouseParams, SPIF_SENDCHANGE);
+    g_mouseFixApplied = false;
+    Log("Mouse delay fix: restored");
+}
+
+// ===================== ESP OVERLAY (in-game HP above heads) =====================
+struct EspCamera {
+    float x, y, z;
+    float yaw, pitch;
+    float fovDeg;
+    bool  valid;
+};
+static CRITICAL_SECTION g_espCS;
+static volatile bool g_espCSReady = false;
+static EspCamera g_espCam = {};
+static std::vector<MapEntity> g_espEntities;
+static void InitEspCS() { if (!g_espCSReady) { InitializeCriticalSection(&g_espCS); g_espCSReady = true; } }
+
+// Project world (wx,wy,wz) to screen (sx,sy) inside a viewport of viewW x viewH.
+// Uses the exact Minecraft yaw/pitch convention: yaw is applied as (yaw+180)
+// because MC camera looks along -Z at yaw=0 in its own frame but the standard
+// WorldToScreen math expects forward=+Z. FOV uses vertical half-angle against
+// viewport height (matches MC's projection). Returns false if the point is
+// behind the camera or far outside the viewport.
+static const double KARVIS_PI = 3.14159265358979323846;
+static bool ProjectWorldToScreen(const EspCamera& c, float wx, float wy, float wz,
+    int viewW, int viewH, float& sx, float& sy) {
+    double dx = (double)wx - (double)c.x;
+    double dy = (double)wy - (double)c.y;
+    double dz = (double)wz - (double)c.z;
+
+    double yawRad = ((double)c.yaw + 180.0) * (KARVIS_PI / 180.0);
+    double pitchRad = (double)c.pitch * (KARVIS_PI / 180.0);
+
+    double cosy = cos(yawRad), siny = sin(yawRad);
+    double cosp = cos(pitchRad), sinp = sin(pitchRad);
+
+    double x2 = dx * cosy + dz * siny;
+    double z2 = -dx * siny + dz * cosy;
+    double y2 = dy * cosp - z2 * sinp;
+    double zz = dy * sinp + z2 * cosp;
+
+    if (zz >= -0.1) return false;
+    double depth = -zz;
+
+    double fov = c.fovDeg > 1.f ? (double)c.fovDeg : 70.0;
+    double fovRad = (fov * 0.5) * (KARVIS_PI / 180.0);
+    double focal = ((double)viewH * 0.5) / tan(fovRad);
+
+    sx = (float)((double)viewW * 0.5 + (x2 * focal / depth));
+    sy = (float)((double)viewH * 0.5 - (y2 * focal / depth));
+
+    return (sx >= -500.f && sx <= viewW + 500.f &&
+        sy >= -500.f && sy <= viewH + 500.f);
+}
+
+// Back buffer for the ESP overlay (reused across frames)
+static HDC     g_espMemDC = nullptr;
+static HBITMAP g_espBmp = nullptr;
+static int     g_espBmpW = 0;
+static int     g_espBmpH = 0;
+
+static void RenderEspTo(HDC hdc, int w, int h) {
+    if (w <= 0 || h <= 0) return;
+    if (!g_espMemDC || g_espBmpW != w || g_espBmpH != h) {
+        if (g_espBmp) { DeleteObject(g_espBmp);   g_espBmp = nullptr; }
+        if (g_espMemDC) { DeleteDC(g_espMemDC);     g_espMemDC = nullptr; }
+        g_espMemDC = CreateCompatibleDC(hdc);
+        g_espBmp = CreateCompatibleBitmap(hdc, w, h);
+        SelectObject(g_espMemDC, g_espBmp);
+        g_espBmpW = w;
+        g_espBmpH = h;
+    }
+    HDC dc = g_espMemDC;
+
+    // Fill with color-key magenta (fully transparent)
+    HBRUSH clr = CreateSolidBrush(RGB(255, 0, 255));
+    RECT r = { 0, 0, w, h };
+    FillRect(dc, &r, clr);
+    DeleteObject(clr);
+
+    EspCamera cam = {};
+    std::vector<MapEntity> ents;
+    if (g_espCSReady) {
+        EnterCriticalSection(&g_espCS);
+        cam = g_espCam;
+        ents = g_espEntities;
+        LeaveCriticalSection(&g_espCS);
+    }
+
+    if (cam.valid) {
+        for (const auto& e : ents) {
+            if (e.isSelf) continue;
+            if (e.kind == 1 && !e.isRealPlayer) continue;
+            if (e.maxHealth <= 0.f) continue;
+
+            // Anchor above the head: posY is the feet. Player model ~1.8 tall,
+            // add a small margin for the hearts to sit above the nametag.
+            float sx, sy;
+            if (!ProjectWorldToScreen(cam, e.x, e.y + 2.4f, e.z, w, h, sx, sy)) continue;
+            if (sx < -64.f || sx > w + 64.f || sy < -32.f || sy > h + 32.f) continue;
+
+            int redHearts = (int)ceilf(e.health / 2.0f);
+            int goldHearts = (int)ceilf(e.absorption / 2.0f);
+            int cx = (int)sx;
+            int baseY = (int)sy;
+            if (redHearts > 0) DrawHeartRow(dc, cx, baseY, redHearts, false);
+            if (goldHearts > 0) DrawHeartRow(dc, cx, baseY - 10, goldHearts, true);
+        }
+    }
+
+    BitBlt(hdc, 0, 0, w, h, dc, 0, 0, SRCCOPY);
+}
+
+LRESULT CALLBACK EspWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+    case WM_CREATE:
+        SetTimer(hWnd, 7, 33, nullptr);
+        return 0;
+    case WM_TIMER:
+        InvalidateRect(hWnd, nullptr, FALSE);
+        return 0;
+    case WM_ERASEBKGND:
+        return TRUE;
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hWnd, &ps);
+        RECT cr; GetClientRect(hWnd, &cr);
+        __try { RenderEspTo(hdc, cr.right, cr.bottom); }
+        __except (EXCEPTION_EXECUTE_HANDLER) {}
+        EndPaint(hWnd, &ps);
+        return 0;
+    }
+    case WM_MOUSEACTIVATE:
+        return MA_NOACTIVATE;
+    case WM_DESTROY:
+        KillTimer(hWnd, 7);
+        if (g_espBmp) { DeleteObject(g_espBmp);   g_espBmp = nullptr; }
+        if (g_espMemDC) { DeleteDC(g_espMemDC);     g_espMemDC = nullptr; }
+        g_espBmpW = g_espBmpH = 0;
+        return 0;
+    }
+    return DefWindowProc(hWnd, msg, wParam, lParam);
+}
+
+static void PositionEspWindow() {
+    if (!g_espWnd) return;
+    HWND game = FindGameWindow();
+    if (!game) { ShowWindow(g_espWnd, SW_HIDE); return; }
+    RECT gr;
+    if (!GetClientRect(game, &gr)) return;
+    POINT tl = { gr.left, gr.top };
+    ClientToScreen(game, &tl);
+    int w = gr.right - gr.left;
+    int h = gr.bottom - gr.top;
+    if (w <= 0 || h <= 0) return;
+    SetWindowPos(g_espWnd, HWND_TOPMOST, tl.x, tl.y, w, h,
+        SWP_NOACTIVATE | SWP_SHOWWINDOW);
+}
+
+DWORD WINAPI EspWindowThread(LPVOID param) {
+    HINSTANCE hInst = (HINSTANCE)param;
+    static bool reg = false;
+    if (!reg) {
+        WNDCLASSEXA wc = {};
+        wc.cbSize = sizeof(wc);
+        wc.lpfnWndProc = EspWndProc;
+        wc.hInstance = hInst;
+        wc.hbrBackground = CreateSolidBrush(RGB(255, 0, 255));
+        wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+        wc.lpszClassName = "KarvisEsp";
+        RegisterClassExA(&wc);
+        reg = true;
+    }
+    g_espWnd = CreateWindowExA(
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE,
+        "KarvisEsp", "KarvisEsp", WS_POPUP,
+        0, 0, 100, 100, nullptr, nullptr, hInst, nullptr);
+    if (!g_espWnd) { Log("ESP: CreateWindow failed"); return 1; }
+    SetLayeredWindowAttributes(g_espWnd, RGB(255, 0, 255), 255, LWA_COLORKEY);
+
+    MSG msg;
+    g_espRunning = true;
+    ULONGLONG lastReposition = 0;
+    while (g_espRunning) {
+        while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            if (msg.message == WM_QUIT) { g_espRunning = false; break; }
+            TranslateMessage(&msg);
+            DispatchMessage(&msg);
+        }
+        ULONGLONG now = GetTickCount64();
+        if (now - lastReposition > 150) {
+            lastReposition = now;
+            HWND game = FindGameWindow();
+            HWND fg = GetForegroundWindow();
+            bool mcAlive = game && IsWindow(game);
+            bool mcShown = mcAlive && IsWindowVisible(game) && !IsIconic(game);
+            bool mcForeground = mcAlive && (fg == game);
+            bool shouldShow = g_settings.espShowHP && g_inGame && mcShown && mcForeground;
+            if (shouldShow) {
+                if (!IsWindowVisible(g_espWnd)) ShowWindow(g_espWnd, SW_SHOWNOACTIVATE);
+                PositionEspWindow();
+            }
+            else {
+                if (IsWindowVisible(g_espWnd)) ShowWindow(g_espWnd, SW_HIDE);
+            }
+        }
+        Sleep(16);
+    }
+    if (g_espWnd) { DestroyWindow(g_espWnd); g_espWnd = nullptr; }
+    return 0;
+}
+
+// ===================== JNI WORKER =====================
+DWORD WINAPI JniWorkerThread(LPVOID param) {
+    timeBeginPeriod(1);
+    Sleep(18000);
+    InitDataCS();
+    InitMapCS();
+    InitEspCS();
+
+    bool init = false;
+    for (int a = 0; a < 5; a++) {
+        if (Java::Initialize()) { init = true; break; }
+        Java::Cleanup();
+        Sleep(5000);
+    }
+
+    if (!init) {
+        snprintf(g_debugStatus, sizeof(g_debugStatus), "JNI INIT FAILED");
+        g_jniRunning = false;
+        timeEndPeriod(1);
+        return 1;
+    }
+
+    snprintf(g_debugStatus, sizeof(g_debugStatus), "Ready - Features loaded");
+    g_jniRunning = true;
+
+    ULONGLONG lastIC = 0, lastPF = 0, lastMapFull = 0, lastMapPose = 0, lastEntities = 0;
+
+    while (g_jniRunning) {
+        ULONGLONG now = GetTickCount64();
+
+        if (now - lastIC >= 200) {
+            g_inGame = SafeIsInWorld();
+            lastIC = now;
+        }
+
+        if (g_nickApplyPending && g_jniRunning && Java::env) {
+            g_nickApplyPending = false;
+            SafeApplyPendingNickname();
+        }
+
+        if (!g_inGame) {
+            Sleep(80);
+            continue;
+        }
+
+        // No jump / hit delay every ~16ms
+        if ((g_settings.noJumpDelay || g_settings.noHitDelay) && (now - lastPF >= 16)) {
+            if (!SafeApplyDelayPatches(g_settings.noJumpDelay, g_settings.noHitDelay)) {
+                g_settings.noJumpDelay = false;
+                g_settings.noHitDelay = false;
+            }
+            lastPF = now;
+        }
+
+        // Minimap + ESP: both need pose/entities. Pose is updated any time
+        // either overlay is active, ESP additionally needs pitch.
+        bool needPose = g_settings.mapEnabled || g_settings.espShowHP;
+        bool needEntities = g_settings.mapEnabled || g_settings.espShowHP;
+
+        if (needPose && now - lastMapPose >= 50) {
+            float px, py, pz, yaw, pitch;
+            if (Java::GetPlayerPoseEx(px, py, pz, yaw, pitch)) {
+                if (g_mapCSReady) {
+                    EnterCriticalSection(&g_mapCS);
+                    g_map.playerX = px; g_map.playerY = py; g_map.playerZ = pz; g_map.playerYaw = yaw;
+                    LeaveCriticalSection(&g_mapCS);
+                }
+                if (g_espCSReady) {
+                    EnterCriticalSection(&g_espCS);
+                    // Eye height for the player is 1.62 blocks above posY.
+                    g_espCam.x = px;
+                    g_espCam.y = py + 1.62f;
+                    g_espCam.z = pz;
+                    g_espCam.yaw = yaw;
+                    g_espCam.pitch = pitch;
+                    g_espCam.fovDeg = 70.f; // default; could read from GameSettings
+                    g_espCam.valid = true;
+                    LeaveCriticalSection(&g_espCS);
+                }
+            }
+            lastMapPose = now;
+        }
+
+        if (needEntities && now - lastEntities >= 200) {
+            float px = g_map.playerX, pz = g_map.playerZ;
+            std::vector<MapEntity> ents;
+            SafeEnumerateEntitiesRaw(&ents, px, pz);
+            if (g_mapCSReady) {
+                EnterCriticalSection(&g_mapCS);
+                g_map.entities = ents;
+                LeaveCriticalSection(&g_mapCS);
+            }
+            if (g_espCSReady) {
+                EnterCriticalSection(&g_espCS);
+                g_espEntities = std::move(ents);
+                LeaveCriticalSection(&g_espCS);
+            }
+            lastEntities = now;
+        }
+
+        // Terrain sampling is only needed for the minimap.
+        if (g_settings.mapEnabled && now - lastMapFull >= 80) {
+            SafeUpdateMinimapData();
+            lastMapFull = now;
+        }
+
+        Sleep(2);
+    }
+
+    Java::Cleanup();
+    timeEndPeriod(1);
+    return 0;
+}
+
+// ===================== MAIN THREAD =====================
+void MainThread(HMODULE hModule) {
+    LogInit();
+    Log("=== Karvis Files v1 starting ===");
+
+    Sleep(5000);
+
+    g_mouseHookThreadHandle = CreateThread(nullptr, 0, MouseHookThread, hModule, 0, &g_mouseHookThreadId);
+    if (!g_mouseHookThreadHandle) {
+        FreeLibraryAndExitThread(hModule, 0);
+        return;
+    }
+
+    for (int i = 0; i < 50 && !g_mouseHook; i++) Sleep(100);
+
+    if (!CreateGuiWindow((HINSTANCE)hModule)) {
+        if (g_mouseHookThreadId) PostThreadMessage(g_mouseHookThreadId, WM_QUIT, 0, 0);
+        if (g_mouseHookThreadHandle) {
+            WaitForSingleObject(g_mouseHookThreadHandle, 3000);
+            CloseHandle(g_mouseHookThreadHandle);
+        }
+        FreeLibraryAndExitThread(hModule, 0);
+        return;
+    }
+
+    // Map window thread (owns its own window/message loop)
+    g_mapThreadHandle = CreateThread(nullptr, 0, MapWindowThread, hModule, 0, &g_mapThreadId);
+
+    // ESP window thread (in-game HP hearts above heads)
+    InitEspCS();
+    g_espThreadHandle = CreateThread(nullptr, 0, EspWindowThread, hModule, 0, &g_espThreadId);
+
+    g_jniRunning = false;
+    g_jniThread = CreateThread(nullptr, 0, JniWorkerThread, hModule, 0, nullptr);
+
+    bool running = true, saw = false;
+
+    while (running) {
+        MsgWaitForMultipleObjects(0, nullptr, FALSE, 1, QS_ALLINPUT);
+        MSG msg;
+        while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            if (msg.message == WM_QUIT) { running = false; break; }
+            TranslateMessage(&msg);
+            DispatchMessage(&msg);
+        }
+
+        if (!running) break;
+
+        // Toggle GUI visibility with SHIFT+ALT
+        bool sd = (GetAsyncKeyState(VK_LSHIFT) & 0x8000) != 0;
+        bool ad = (GetAsyncKeyState(VK_LMENU) & 0x8000) != 0;
+        bool san = sd && ad;
+        if (san && !saw) {
+            if (!IsWindowVisible(g_hWnd)) ShowWindow(g_hWnd, SW_SHOWNOACTIVATE);
+            else ShowWindow(g_hWnd, SW_HIDE);
+        }
+        saw = san;
+
+        // Borderless fullscreen toggle
+        if (g_f11Pressed) {
+            g_f11Pressed = false;
+            HWND game = FindGameWindow();
+            if (game) ToggleBorderlessFullscreen(game);
+        }
+
+        // Mouse delay fix: only active while Minecraft is the foreground
+        // window. Apply when MC gets focus with the toggle on, restore the
+        // moment MC loses focus or the toggle is turned off. This keeps the
+        // fix scoped to the game and avoids persisting system-wide pointer
+        // changes to the desktop / other apps.
+        {
+            HWND mcWnd = FindGameWindow();
+            HWND fgWnd = GetForegroundWindow();
+            bool mcForeground = mcWnd && IsWindow(mcWnd) && fgWnd == mcWnd;
+            bool shouldApply = g_settings.mouseDelayFix && mcForeground;
+            if (shouldApply && !g_mouseFixApplied) {
+                ApplyMouseDelayFix();
+            }
+            else if (!shouldApply && g_mouseFixApplied) {
+                RestoreMouseDelayFix();
+            }
+        }
+
+        // DELETE key to unload
+        if (GetAsyncKeyState(VK_DELETE) & 0x8000) {
+            running = false;
+        }
+    }
+
+    // Restore mouse settings before tearing anything else down.
+    if (g_mouseFixApplied) RestoreMouseDelayFix();
+
+    // Shut down ESP thread
+    g_espRunning = false;
+    if (g_espThreadId) PostThreadMessage(g_espThreadId, WM_QUIT, 0, 0);
+    if (g_espThreadHandle) {
+        WaitForSingleObject(g_espThreadHandle, 3000);
+        CloseHandle(g_espThreadHandle);
+        g_espThreadHandle = nullptr;
+    }
+    g_espThreadId = 0;
+
+    // Shut down map thread
+    g_mapRunning = false;
+    if (g_mapThreadId) PostThreadMessage(g_mapThreadId, WM_QUIT, 0, 0);
+    if (g_mapThreadHandle) {
+        WaitForSingleObject(g_mapThreadHandle, 3000);
+        CloseHandle(g_mapThreadHandle);
+        g_mapThreadHandle = nullptr;
+    }
+    g_mapThreadId = 0;
+
+    g_jniRunning = false;
+    if (g_jniThread) {
+        WaitForSingleObject(g_jniThread, 8000);
+        CloseHandle(g_jniThread);
+        g_jniThread = nullptr;
+    }
+
+    if (g_mouseHookThreadId) PostThreadMessage(g_mouseHookThreadId, WM_QUIT, 0, 0);
+    if (g_mouseHookThreadHandle) {
+        WaitForSingleObject(g_mouseHookThreadHandle, 3000);
+        CloseHandle(g_mouseHookThreadHandle);
+        g_mouseHookThreadHandle = nullptr;
+    }
+    g_mouseHookThreadId = 0;
+
+    if (g_nickDialogWnd) { DestroyWindow(g_nickDialogWnd); g_nickDialogWnd = nullptr; }
+    if (g_hWnd) DestroyWindow(g_hWnd);
+
+    if (g_fontTitle) { DeleteObject(g_fontTitle); g_fontTitle = nullptr; }
+    if (g_fontItem) { DeleteObject(g_fontItem); g_fontItem = nullptr; }
+    if (g_fontSmall) { DeleteObject(g_fontSmall); g_fontSmall = nullptr; }
+    if (g_fontTiny) { DeleteObject(g_fontTiny); g_fontTiny = nullptr; }
+
+    if (g_dataCSReady) { DeleteCriticalSection(&g_dataCS); g_dataCSReady = false; }
+    if (g_mapCSReady) { DeleteCriticalSection(&g_mapCS);  g_mapCSReady = false; }
+    if (g_espCSReady) { DeleteCriticalSection(&g_espCS);  g_espCSReady = false; }
+
+    Log("=== Karvis Files v1 unloading ===");
+    FreeLibraryAndExitThread(hModule, 0);
+}
+
+// ===================== DLL ENTRY =====================
+BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {
+    switch (ul_reason_for_call) {
+    case DLL_PROCESS_ATTACH:
+        DisableThreadLibraryCalls(hModule);
+        CreateThread(nullptr, 0, (LPTHREAD_START_ROUTINE)MainThread, hModule, 0, nullptr);
+        break;
+    case DLL_PROCESS_DETACH:
+        break;
+    }
+    return TRUE;
+}
