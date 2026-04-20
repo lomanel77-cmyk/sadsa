@@ -3456,6 +3456,16 @@ static void SafeUpdateMinimapData() {
     __except (EXCEPTION_EXECUTE_HANDLER) { Log("UpdateMinimapData crashed"); }
 }
 
+static void SafeUpdateCameraData() {
+    __try { Java::UpdateCameraData(); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { Log("UpdateCameraData crashed"); }
+}
+
+static void SafeCollectEspEntitiesRaw(void* outVec) {
+    __try { Java::CollectEspEntities(*reinterpret_cast<std::vector<EspEntityData>*>(outVec)); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { Log("CollectEspEntities crashed"); }
+}
+
 // ===================== MOUSE DELAY FIX =====================
 // Disables Windows "Enhance pointer precision" (mouse acceleration) WITHOUT
 // touching mouse speed. Speed = 10 is the neutral sensitivity value, but
@@ -3757,10 +3767,10 @@ static void DrawESPEntities(int w, int h) {
             bool hasAbsorption = e.health > e.maxHealth;
             float absPct = 0.0f;
             if (hasAbsorption) {
-                absPct = std::min(1.0f, (e.health - e.maxHealth) / e.maxHealth);
+                absPct = min(1.0f, (e.health - e.maxHealth) / e.maxHealth);
                 hf = 1.0f;
             }
-            hf = std::max(0.0f, std::min(1.0f, hf));
+            hf = max(0.0f, min(1.0f, hf));
 
             int barX = bx - 6;
             int fillH = (int)((boxH - 2) * hf);
@@ -3792,8 +3802,8 @@ static void DrawESPEntities(int w, int h) {
         }
 
         if (!e.name.empty()) {
-            int baseFont = std::max(14, std::min(20, h / 55));
-            int nameFontSize = std::max(baseFont, std::min(64, (int)(boxH / 7.0f)));
+            int baseFont = max(14, min(20, h / 55));
+            int nameFontSize = max(baseFont, min(64, (int)(boxH / 7.0f)));
 
             char hpBuf[32];
             bool hasAbs = e.health > e.maxHealth;
@@ -3915,8 +3925,7 @@ DWORD WINAPI JniWorkerThread(LPVOID param) {
 
         // Camera data for ESP (high frequency for smooth tracking)
         if (needEsp && now - lastMapPose >= 8) {
-            __try { Java::UpdateCameraData(); }
-            __except (EXCEPTION_EXECUTE_HANDLER) {}
+            SafeUpdateCameraData();
             lastMapPose = now;
         }
         // Map pose (lower frequency)
@@ -3947,16 +3956,13 @@ DWORD WINAPI JniWorkerThread(LPVOID param) {
 
             // ESP entities (separate collection for HP data)
             if (needEsp) {
-                __try {
-                    std::vector<EspEntityData> espEnts;
-                    Java::CollectEspEntities(espEnts);
-                    if (g_espCSReady) {
-                        EnterCriticalSection(&g_espCS);
-                        g_espEntities = std::move(espEnts);
-                        LeaveCriticalSection(&g_espCS);
-                    }
+                std::vector<EspEntityData> espEnts;
+                SafeCollectEspEntitiesRaw(&espEnts);
+                if (g_espCSReady) {
+                    EnterCriticalSection(&g_espCS);
+                    g_espEntities = std::move(espEnts);
+                    LeaveCriticalSection(&g_espCS);
                 }
-                __except (EXCEPTION_EXECUTE_HANDLER) {}
             }
             lastEntities = now;
         }
