@@ -182,6 +182,7 @@ struct MapEntity {
     bool  isSelf = false;       // local player - never rendered
     bool  isRealPlayer = false; // only true for entries in World.playerEntities
     bool  hasHelmet = false;    // armor slot 3 non-empty (visual overlay)
+    bool  isNpc = false;        // name/class heuristics for server-side NPCs
     float health = 0.f;         // 0..maxHealth
     float maxHealth = 0.f;
     float absorption = 0.f;     // extra "golden heart" hp
@@ -225,6 +226,22 @@ static HWND FindGameWindow() {
     if (!hw) hw = FindWindowA(nullptr, "Minecraft");
     if (!hw) hw = FindWindowA("SunAwtFrame", nullptr);
     return hw;
+}
+
+static bool IsMinecraftForegroundWindow(HWND mcWnd) {
+    if (!mcWnd || !IsWindow(mcWnd)) return false;
+    HWND fg = GetForegroundWindow();
+    if (!fg) return false;
+    return (fg == mcWnd) || IsChild(mcWnd, fg);
+}
+
+static bool IsCursorInsideWindow(HWND wnd) {
+    if (!wnd || !IsWindow(wnd)) return false;
+    POINT pt;
+    if (!GetCursorPos(&pt)) return false;
+    RECT r;
+    if (!GetWindowRect(wnd, &r)) return false;
+    return PtInRect(&r, pt) != 0;
 }
 
 static void ToggleBorderlessFullscreen(HWND game) {
@@ -1010,6 +1027,9 @@ void Java::EnumerateEntities(std::vector<MapEntity>& out, float selfX, float sel
         std::string cs(classSig);
         for (auto& c : cs) c = (char)tolower((unsigned char)c);
 
+        bool classNpcHint = cs.find("npc") != std::string::npos || cs.find("citizens") != std::string::npos ||
+            cs.find("human") != std::string::npos;
+
         bool isPlayer = cs.find("player") != std::string::npos;
         // Real player = present in World.playerEntities. NPC bots that extend
         // EntityPlayer* but aren't in that list are filtered out.
@@ -1059,6 +1079,12 @@ void Java::EnumerateEntities(std::vector<MapEntity>& out, float selfX, float sel
                 env->DeleteLocalRef(jn);
             }
         }
+
+        std::string nm(me.name);
+        for (auto& c : nm) c = (char)tolower((unsigned char)c);
+        bool nameNpcHint = nm.find("npc") != std::string::npos || nm.find("shop") != std::string::npos ||
+            nm.find("seller") != std::string::npos || nm.find("quest") != std::string::npos;
+        me.isNpc = classNpcHint || (nameNpcHint && !me.isRealPlayer);
 
         // Head color from name hash (deterministic per nickname)
         if (me.kind == 1 && me.name[0]) {
@@ -1622,8 +1648,22 @@ static void DrawHeartRow(HDC hdc, int cx, int topY, int count, bool absorption) 
     int x = cx - rowW / 2;
     COLORREF fill = absorption ? RGB(252, 204, 64) : RGB(230, 40, 50);
     COLORREF dark = absorption ? RGB(90, 66, 12) : RGB(80, 0, 0);
-    for (int i = 0; i < count; i++) {
-        DrawHeart(hdc, x + i * (sz + gap), topY, sz, fill, dark);
+    for (int i = 0; i < count; i++) DrawHeart(hdc, x + i * (sz + gap), topY, sz, fill, dark);
+}
+
+static void DrawHeartStack(HDC hdc, int cx, int baseY, int redHearts, int goldHearts) {
+    int row = 0;
+    while (redHearts > 0) {
+        int n = redHearts > 10 ? 10 : redHearts;
+        DrawHeartRow(hdc, cx, baseY - row * 8, n, false);
+        redHearts -= n;
+        row++;
+    }
+    while (goldHearts > 0) {
+        int n = goldHearts > 10 ? 10 : goldHearts;
+        DrawHeartRow(hdc, cx, baseY - row * 8, n, true);
+        goldHearts -= n;
+        row++;
     }
 }
 
@@ -1739,6 +1779,7 @@ static void RenderMinimapTo(HDC hdc, int mapW, int mapH) {
                 // and item / xp-orb / other entities. The minimap now only
                 // displays actual connected players and hostile mobs.
                 if (e.kind == 1 && !e.isRealPlayer) continue;
+                if (e.isNpc) continue;
                 if (e.kind == 3) continue; // passive mobs (villagers, cows ...)
                 if (e.kind == 4) continue; // items, xp orbs, arrows, etc.
 
@@ -3092,6 +3133,7 @@ static void RenderEspTo(HDC hdc, int w, int h) {
         for (const auto& e : ents) {
             if (e.isSelf) continue;
             if (e.kind == 1 && !e.isRealPlayer) continue;
+            if (e.isNpc) continue;
             if (e.maxHealth <= 0.f) continue;
 
             // Anchor above the head: posY is the feet. Player model ~1.8 tall,
@@ -3104,8 +3146,7 @@ static void RenderEspTo(HDC hdc, int w, int h) {
             int goldHearts = (int)ceilf(e.absorption / 2.0f);
             int cx = (int)sx;
             int baseY = (int)sy;
-            if (redHearts > 0) DrawHeartRow(dc, cx, baseY, redHearts, false);
-            if (goldHearts > 0) DrawHeartRow(dc, cx, baseY - 10, goldHearts, true);
+            DrawHeartStack(dc, cx, baseY, redHearts, goldHearts);
         }
     }
 
@@ -3397,9 +3438,9 @@ void MainThread(HMODULE hModule) {
         // changes to the desktop / other apps.
         {
             HWND mcWnd = FindGameWindow();
-            HWND fgWnd = GetForegroundWindow();
-            bool mcForeground = mcWnd && IsWindow(mcWnd) && fgWnd == mcWnd;
-            bool shouldApply = g_settings.mouseDelayFix && mcForeground;
+            bool mcForeground = IsMinecraftForegroundWindow(mcWnd);
+            bool mouseInsideMc = IsCursorInsideWindow(mcWnd);
+            bool shouldApply = g_settings.mouseDelayFix && g_inGame && mcForeground && mouseInsideMc;
             if (shouldApply && !g_mouseFixApplied) {
                 ApplyMouseDelayFix();
             }
