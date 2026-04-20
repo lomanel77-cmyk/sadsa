@@ -57,8 +57,13 @@ ať to renderování, těch hp aby to ukazovalo fungovalo úplně stejně jako t
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "msimg32.lib")
 #pragma comment(lib, "winmm.lib")
+#include <gl/GL.h>
+#pragma comment(lib, "opengl32.lib")
 
 typedef jint(JNICALL* JNI_GetCreatedJavaVMs_t)(JavaVM**, jsize, jsize*);
+
+struct Vec3 { double x = 0, y = 0, z = 0; };
+struct Rotation { float yaw = 0.f, pitch = 0.f; };
 
 // ===================== LOGGING =====================
 static FILE* g_logFile = nullptr;
@@ -154,11 +159,42 @@ static DWORD g_mapThreadId = 0;
 static HANDLE g_mapThreadHandle = nullptr;
 static volatile bool g_mapRunning = false;
 
-// ESP overlay (in-game HP above heads, projected)
-static HWND  g_espWnd = nullptr;
-static DWORD g_espThreadId = 0;
-static HANDLE g_espThreadHandle = nullptr;
-static volatile bool g_espRunning = false;
+// ===================== ESP (OpenGL in-game HP) =====================
+static const double KARVIS_PI = 3.14159265358979323846;
+
+struct EspEntityData {
+    float x, y, z;           // world position (feet)
+    float health = 0.0f;
+    float maxHealth = 20.0f;
+    float absorption = 0.0f;
+    float height = 1.8f;
+    bool  isPlayer = false;
+    bool  isRealPlayer = false;
+    bool  isDead = false;
+    std::string name;
+};
+
+struct EspCameraData {
+    Vec3 camPos = {};
+    Rotation camRot = {};
+    float camFov = 70.0f;
+    Vec3 renderPos = {};
+    float partialTicks = 0.5f;
+    float mvMatrix[16] = {};
+    float projMatrix[16] = {};
+    bool  matricesValid = false;
+    bool  valid = false;
+};
+
+static CRITICAL_SECTION g_espCS;
+static volatile bool g_espCSReady = false;
+static void InitEspCS() { if (!g_espCSReady) { InitializeCriticalSection(&g_espCS); g_espCSReady = true; } }
+
+static std::vector<EspEntityData> g_espEntities;
+static EspCameraData g_espCam;
+
+// Remove old ESP overlay window - we use OpenGL hook instead
+// (g_espWnd, g_espThreadId, g_espThreadHandle, g_espRunning are no longer needed)
 
 // ===================== MINIMAP DATA =====================
 // terrain grid: TERRAIN_DIM x TERRAIN_DIM samples centered on player
@@ -358,6 +394,24 @@ public:
     static jmethodID method_list_size;
     static jmethodID method_list_get;
 
+    // Camera / matrix data for ESP
+    static jclass activeRenderInfoClass;
+    static jfieldID field_ariModelview;
+    static jfieldID field_ariProjection;
+    static jmethodID method_getRenderManager;
+    static jclass renderManagerClass;
+    static jfieldID field_renderPosX, field_renderPosY, field_renderPosZ;
+    static jfieldID field_timer;
+    static jfieldID field_renderPartialTicks;
+    static jfieldID field_gameSettings;
+    static jfieldID field_fovSetting;
+    static jfieldID field_prevPosX, field_prevPosY, field_prevPosZ;
+    static jfieldID field_isDead;
+    static jfieldID field_height;
+    static jclass armorStandClass;
+    static jfieldID field_entityId;
+    static jclass entityPlayerClass;
+
     // String
     static jclass stringClass;
 
@@ -385,6 +439,10 @@ public:
     static bool GetPlayerPoseEx(float& x, float& y, float& z, float& yaw, float& pitch);
     static int  GetBlockColorAt(int bx, int by, int bz, uint8_t& flagsOut); // returns RGB or -1
     static void EnumerateEntities(std::vector<MapEntity>& out, float selfX, float selfZ);
+    static float ReadPartialTicks();
+    static float GetFOV();
+    static void UpdateCameraData();
+    static void CollectEspEntities(std::vector<EspEntityData>& out);
 };
 
 // Static member definitions
@@ -445,6 +503,26 @@ jmethodID Java::method_list_size = nullptr;
 jmethodID Java::method_list_get = nullptr;
 
 jclass Java::stringClass = nullptr;
+jclass Java::activeRenderInfoClass = nullptr;
+jfieldID Java::field_ariModelview = nullptr;
+jfieldID Java::field_ariProjection = nullptr;
+jmethodID Java::method_getRenderManager = nullptr;
+jclass Java::renderManagerClass = nullptr;
+jfieldID Java::field_renderPosX = nullptr;
+jfieldID Java::field_renderPosY = nullptr;
+jfieldID Java::field_renderPosZ = nullptr;
+jfieldID Java::field_timer = nullptr;
+jfieldID Java::field_renderPartialTicks = nullptr;
+jfieldID Java::field_gameSettings = nullptr;
+jfieldID Java::field_fovSetting = nullptr;
+jfieldID Java::field_prevPosX = nullptr;
+jfieldID Java::field_prevPosY = nullptr;
+jfieldID Java::field_prevPosZ = nullptr;
+jfieldID Java::field_isDead = nullptr;
+jfieldID Java::field_height = nullptr;
+jclass Java::armorStandClass = nullptr;
+jfieldID Java::field_entityId = nullptr;
+jclass Java::entityPlayerClass = nullptr;
 
 std::string Java::mcClassName;
 bool Java::cacheInitialized = false;
@@ -715,6 +793,151 @@ bool Java::InitCache() {
     if (env->ExceptionCheck()) env->ExceptionClear();
     if (sT) { stringClass = (jclass)env->NewGlobalRef(sT); env->DeleteLocalRef(sT); }
 
+
+    // === Camera / Matrix fields for ESP ===
+    if (mcClass) {
+        field_gameSettings = GetFieldID(mcClass, "gameSettings", "Lnet/minecraft/client/settings/GameSettings;");
+        if (field_gameSettings) {
+            jobject mc3 = GetMinecraft();
+            if (mc3) {
+                jobject gs = env->GetObjectField(mc3, field_gameSettings);
+                if (gs) {
+                    jclass gsC = env->GetObjectClass(gs);
+                    if (gsC) {
+                        field_fovSetting = GetFieldID(gsC, "fovSetting", "F");
+                        env->DeleteLocalRef(gsC);
+                    }
+                    env->DeleteLocalRef(gs);
+                }
+                env->DeleteLocalRef(mc3);
+            }
+        }
+
+        // Timer / renderPartialTicks
+        field_timer = GetFieldID(mcClass, "timer", "Lnet/minecraft/util/Timer;");
+        if (!field_timer && jvmti) {
+            jint fc = 0; jfieldID* fl = nullptr;
+            if (jvmti->GetClassFields(mcClass, &fc, &fl) == JVMTI_ERROR_NONE) {
+                for (int i = 0; i < fc && !field_timer; i++) {
+                    char* fn = nullptr; char* fs = nullptr;
+                    jvmti->GetFieldName(mcClass, fl[i], &fn, &fs, nullptr);
+                    if (fs && fs[0] == 'L') {
+                        jint mods = 0; jvmti->GetFieldModifiers(mcClass, fl[i], &mods);
+                        if (!(mods & 0x0008)) {
+                            std::string cn(fs + 1, strlen(fs) - 2);
+                            jclass tc = FindClass(cn.c_str());
+                            if (tc) {
+                                jfieldID rpt = env->GetFieldID(tc, "renderPartialTicks", "F");
+                                if (!rpt || env->ExceptionCheck()) {
+                                    env->ExceptionClear();
+                                    rpt = env->GetFieldID(tc, "field_74281_c", "F");
+                                    if (env->ExceptionCheck()) { env->ExceptionClear(); rpt = nullptr; }
+                                }
+                                if (rpt) { field_timer = fl[i]; field_renderPartialTicks = rpt; }
+                                env->DeleteLocalRef(tc);
+                            }
+                        }
+                    }
+                    if (fn) jvmti->Deallocate((unsigned char*)fn);
+                    if (fs) jvmti->Deallocate((unsigned char*)fs);
+                }
+                jvmti->Deallocate((unsigned char*)fl);
+            }
+        }
+    }
+
+    // ActiveRenderInfo (MODELVIEW, PROJECTION buffers)
+    {
+        const char* ariN[] = { "net/minecraft/client/renderer/ActiveRenderInfo", nullptr };
+        jclass ariT = FindClass(ariN[0]);
+        if (ariT) {
+            activeRenderInfoClass = (jclass)env->NewGlobalRef(ariT);
+            env->DeleteLocalRef(ariT);
+
+            const char* mvN[] = { "MODELVIEW", "field_178812_b", nullptr };
+            for (int i = 0; mvN[i]; i++) {
+                jfieldID f = env->GetStaticFieldID(activeRenderInfoClass, mvN[i], "Ljava/nio/FloatBuffer;");
+                if (f && !env->ExceptionCheck()) { field_ariModelview = f; break; }
+                env->ExceptionClear();
+            }
+            const char* prN[] = { "PROJECTION", "field_178813_c", nullptr };
+            for (int i = 0; prN[i]; i++) {
+                jfieldID f = env->GetStaticFieldID(activeRenderInfoClass, prN[i], "Ljava/nio/FloatBuffer;");
+                if (f && !env->ExceptionCheck()) { field_ariProjection = f; break; }
+                env->ExceptionClear();
+            }
+
+            if ((!field_ariModelview || !field_ariProjection) && jvmti) {
+                jint ac = 0; jfieldID* af = nullptr;
+                if (jvmti->GetClassFields(activeRenderInfoClass, &ac, &af) == JVMTI_ERROR_NONE) {
+                    jfieldID fb[4]; int fbc = 0;
+                    for (int i = 0; i < ac && fbc < 4; i++) {
+                        char* n = nullptr; char* s2 = nullptr;
+                        jvmti->GetFieldName(activeRenderInfoClass, af[i], &n, &s2, nullptr);
+                        if (s2 && strcmp(s2, "Ljava/nio/FloatBuffer;") == 0) {
+                            jint m = 0; jvmti->GetFieldModifiers(activeRenderInfoClass, af[i], &m);
+                            if (m & 0x0008) fb[fbc++] = af[i];
+                        }
+                        if (n) jvmti->Deallocate((unsigned char*)n);
+                        if (s2) jvmti->Deallocate((unsigned char*)s2);
+                    }
+                    if (fbc >= 2) {
+                        if (!field_ariModelview) field_ariModelview = fb[0];
+                        if (!field_ariProjection) field_ariProjection = fb[1];
+                    }
+                    jvmti->Deallocate((unsigned char*)af);
+                }
+            }
+        }
+    }
+
+    // RenderManager (renderPosX/Y/Z)
+    {
+        const char* grmN[] = { "getRenderManager", "func_175598_ae", nullptr };
+        method_getRenderManager = TryGetMethod(env, mcClass, grmN, "()Lnet/minecraft/client/renderer/entity/RenderManager;");
+        jclass rmT = FindClass("net/minecraft/client/renderer/entity/RenderManager");
+        if (rmT) {
+            renderManagerClass = (jclass)env->NewGlobalRef(rmT);
+            env->DeleteLocalRef(rmT);
+            const char* rpxN[] = { "renderPosX", "field_78725_b", nullptr };
+            field_renderPosX = TryGetField(env, renderManagerClass, rpxN, "D");
+            const char* rpyN[] = { "renderPosY", "field_78726_c", nullptr };
+            field_renderPosY = TryGetField(env, renderManagerClass, rpyN, "D");
+            const char* rpzN[] = { "renderPosZ", "field_78723_d", nullptr };
+            field_renderPosZ = TryGetField(env, renderManagerClass, rpzN, "D");
+        }
+    }
+
+    if (entityClass) {
+        field_prevPosX = GetFieldID(entityClass, "prevPosX", "D");
+        field_prevPosY = GetFieldID(entityClass, "prevPosY", "D");
+        field_prevPosZ = GetFieldID(entityClass, "prevPosZ", "D");
+        field_isDead = GetFieldID(entityClass, "isDead", "Z");
+        field_height = GetFieldID(entityClass, "height", "F");
+        const char* eidN[] = { "entityId", "field_145783_c", nullptr };
+        field_entityId = TryGetField(env, entityClass, eidN, "I");
+    }
+
+    {
+        jclass epT = FindClass("net/minecraft/entity/player/EntityPlayer");
+        if (epT) {
+            entityPlayerClass = (jclass)env->NewGlobalRef(epT);
+            env->DeleteLocalRef(epT);
+        }
+    }
+
+    {
+        const char* asN[] = { "net/minecraft/entity/item/EntityArmorStand", nullptr };
+        jclass asT = FindClass(asN[0]);
+        if (asT) { armorStandClass = (jclass)env->NewGlobalRef(asT); env->DeleteLocalRef(asT); }
+    }
+
+    Log("ESP camera: ariMV=%s ariProj=%s rmPos=%s timer=%s fov=%s entityId=%s isDead=%s height=%s",
+        field_ariModelview ? "OK" : "NULL", field_ariProjection ? "OK" : "NULL",
+        (field_renderPosX && field_renderPosY && field_renderPosZ) ? "OK" : "NULL",
+        field_timer ? "OK" : "NULL", field_fovSetting ? "OK" : "NULL",
+        field_entityId ? "OK" : "NULL", field_isDead ? "OK" : "NULL", field_height ? "OK" : "NULL");
+
     cacheInitialized = true;
     Log("InitCache complete (mapSupport=%s, entitySupport=%s)",
         (method_getBlockState && blockPosCtor ? "YES" : "NO"),
@@ -735,6 +958,10 @@ void Java::Cleanup() {
         if (mapColorClass) { env->DeleteGlobalRef(mapColorClass); mapColorClass = nullptr; }
         if (listClass) { env->DeleteGlobalRef(listClass); listClass = nullptr; }
         if (stringClass) { env->DeleteGlobalRef(stringClass); stringClass = nullptr; }
+        if (activeRenderInfoClass) { env->DeleteGlobalRef(activeRenderInfoClass); activeRenderInfoClass = nullptr; }
+        if (renderManagerClass) { env->DeleteGlobalRef(renderManagerClass); renderManagerClass = nullptr; }
+        if (armorStandClass) { env->DeleteGlobalRef(armorStandClass); armorStandClass = nullptr; }
+        if (entityPlayerClass) { env->DeleteGlobalRef(entityPlayerClass); entityPlayerClass = nullptr; }
         if (cachedClassLoader) { env->DeleteGlobalRef(cachedClassLoader); cachedClassLoader = nullptr; }
     }
     if (jvm && attached) {
@@ -743,6 +970,14 @@ void Java::Cleanup() {
     }
     env = nullptr;
     jvmti = nullptr;
+    field_ariModelview = field_ariProjection = nullptr;
+    method_getRenderManager = nullptr;
+    field_renderPosX = field_renderPosY = field_renderPosZ = nullptr;
+    field_timer = field_renderPartialTicks = nullptr;
+    field_gameSettings = field_fovSetting = nullptr;
+    field_prevPosX = field_prevPosY = field_prevPosZ = nullptr;
+    field_isDead = field_height = nullptr;
+    field_entityId = nullptr;
     cacheInitialized = false;
 }
 
@@ -1156,6 +1391,218 @@ void Java::EnumerateEntities(std::vector<MapEntity>& out, float selfX, float sel
     if (thePlayer) env->DeleteLocalRef(thePlayer);
     env->DeleteLocalRef(list);
 }
+
+
+float Java::ReadPartialTicks() {
+    if (!env || !field_timer || !field_renderPartialTicks) return 0.5f;
+    jobject mc = GetMinecraft(); if (!mc) return 0.5f;
+    jobject tObj = env->GetObjectField(mc, field_timer); env->DeleteLocalRef(mc);
+    if (!tObj) return 0.5f;
+    float pt = env->GetFloatField(tObj, field_renderPartialTicks); env->DeleteLocalRef(tObj);
+    if (pt < 0.0f || pt > 1.0f) pt = 0.5f;
+    return pt;
+}
+
+float Java::GetFOV() {
+    if (!env || !field_gameSettings || !field_fovSetting) return 70.0f;
+    jobject mc = GetMinecraft(); if (!mc) return 70.0f;
+    jobject gs = env->GetObjectField(mc, field_gameSettings); env->DeleteLocalRef(mc);
+    if (!gs) return 70.0f;
+    float fov = env->GetFloatField(gs, field_fovSetting); env->DeleteLocalRef(gs);
+    return (fov < 1 || fov > 179) ? 70.0f : fov;
+}
+
+void Java::UpdateCameraData() {
+    if (!env) return;
+    jobject player = GetPlayer(); if (!player) return;
+    float pt = ReadPartialTicks();
+
+    float localMV[16] = {}; float localProj[16] = {}; bool matricesOK = false;
+
+    Vec3 cur = { env->GetDoubleField(player, field_posX), env->GetDoubleField(player, field_posY), env->GetDoubleField(player, field_posZ) };
+    Vec3 prev = {};
+    if (field_prevPosX) prev.x = env->GetDoubleField(player, field_prevPosX);
+    if (field_prevPosY) prev.y = env->GetDoubleField(player, field_prevPosY);
+    if (field_prevPosZ) prev.z = env->GetDoubleField(player, field_prevPosZ);
+
+    Vec3 renderPos = { 0,0,0 }; bool gotRM = false;
+    if (method_getRenderManager && field_renderPosX) {
+        jobject mc = GetMinecraft();
+        if (mc) {
+            jobject rm = env->CallObjectMethod(mc, method_getRenderManager);
+            if (rm && !env->ExceptionCheck()) {
+                renderPos.x = env->GetDoubleField(rm, field_renderPosX);
+                renderPos.y = env->GetDoubleField(rm, field_renderPosY);
+                renderPos.z = env->GetDoubleField(rm, field_renderPosZ);
+                env->DeleteLocalRef(rm); gotRM = true;
+            }
+            else { env->ExceptionClear(); }
+            env->DeleteLocalRef(mc);
+        }
+    }
+    if (!gotRM) {
+        renderPos.x = prev.x + (cur.x - prev.x) * pt;
+        renderPos.y = prev.y + (cur.y - prev.y) * pt;
+        renderPos.z = prev.z + (cur.z - prev.z) * pt;
+    }
+
+    Vec3 camPos = { renderPos.x, renderPos.y + 1.62, renderPos.z };
+    Rotation camRot = { 0, 0 }; float camFov = 70.0f;
+    bool gotRot = false, gotFov = false;
+
+    if (activeRenderInfoClass && field_ariModelview) {
+        jobject mvBuf = env->GetStaticObjectField(activeRenderInfoClass, field_ariModelview);
+        if (mvBuf) {
+            float* mv = (float*)env->GetDirectBufferAddress(mvBuf);
+            if (mv && (fabsf(mv[0]) > 0.0001f || fabsf(mv[5]) > 0.0001f)) {
+                memcpy(localMV, mv, 16 * sizeof(float));
+                float sinP = mv[6];
+                if (sinP >= -1.0f && sinP <= 1.0f) {
+                    camRot.pitch = (float)(asin((double)sinP) * 180.0 / KARVIS_PI);
+                    float rawYaw = (float)(atan2((double)mv[8], (double)mv[0]) * 180.0 / KARVIS_PI);
+                    camRot.yaw = rawYaw - 180.0f;
+                    while (camRot.yaw > 180.0f) camRot.yaw -= 360.0f;
+                    while (camRot.yaw < -180.0f) camRot.yaw += 360.0f;
+                    gotRot = true;
+                }
+            }
+            env->DeleteLocalRef(mvBuf);
+        }
+    }
+    if (activeRenderInfoClass && field_ariProjection) {
+        jobject prjBuf = env->GetStaticObjectField(activeRenderInfoClass, field_ariProjection);
+        if (prjBuf) {
+            float* prj = (float*)env->GetDirectBufferAddress(prjBuf);
+            if (prj) {
+                float focalY = prj[5];
+                if (focalY > 0.01f) {
+                    memcpy(localProj, prj, 16 * sizeof(float));
+                    if (gotRot) matricesOK = true;
+                    float fov = (float)(2.0 * atan(1.0 / (double)focalY) * 180.0 / KARVIS_PI);
+                    if (fov > 1.0f && fov < 179.0f) { camFov = fov; gotFov = true; }
+                }
+            }
+            env->DeleteLocalRef(prjBuf);
+        }
+    }
+
+    if (!gotRot) {
+        camRot.yaw = env->GetFloatField(player, field_rotationYaw);
+        camRot.pitch = env->GetFloatField(player, field_rotationPitch);
+    }
+    if (!gotFov) camFov = GetFOV();
+
+    env->DeleteLocalRef(player);
+
+    if (g_espCSReady) {
+        EnterCriticalSection(&g_espCS);
+        g_espCam.camPos = camPos;
+        g_espCam.camRot = camRot;
+        g_espCam.camFov = camFov;
+        g_espCam.partialTicks = pt;
+        g_espCam.renderPos = renderPos;
+        if (matricesOK) {
+            memcpy(g_espCam.mvMatrix, localMV, sizeof(g_espCam.mvMatrix));
+            memcpy(g_espCam.projMatrix, localProj, sizeof(g_espCam.projMatrix));
+        }
+        g_espCam.matricesValid = matricesOK;
+        g_espCam.valid = true;
+        LeaveCriticalSection(&g_espCS);
+    }
+}
+
+void Java::CollectEspEntities(std::vector<EspEntityData>& out) {
+    out.clear();
+    if (!env || !listClass || !field_loadedEntityList || !entityClass ||
+        !field_posX || !field_posY || !field_posZ) return;
+
+    jobject mc = GetMinecraft();
+    if (!mc) return;
+    jobject world = env->GetObjectField(mc, field_theWorld);
+    jobject thePlayer = field_thePlayer ? env->GetObjectField(mc, field_thePlayer) : nullptr;
+    env->DeleteLocalRef(mc);
+    if (!world) { if (thePlayer) env->DeleteLocalRef(thePlayer); return; }
+
+    jobject list = env->GetObjectField(world, field_loadedEntityList);
+    env->DeleteLocalRef(world);
+    if (!list) { if (thePlayer) env->DeleteLocalRef(thePlayer); return; }
+
+    jint size = env->CallIntMethod(list, method_list_size);
+    if (env->ExceptionCheck()) { env->ExceptionClear(); env->DeleteLocalRef(list); if (thePlayer) env->DeleteLocalRef(thePlayer); return; }
+    if (size > 512) size = 512;
+
+    out.reserve((size_t)size);
+    for (jint i = 0; i < size; i++) {
+        jobject e = env->CallObjectMethod(list, method_list_get, i);
+        if (env->ExceptionCheck()) { env->ExceptionClear(); continue; }
+        if (!e) continue;
+
+        if (thePlayer && env->IsSameObject(e, thePlayer)) { env->DeleteLocalRef(e); continue; }
+        if (armorStandClass && env->IsInstanceOf(e, armorStandClass)) { env->DeleteLocalRef(e); continue; }
+
+        bool isLiving = (entityLivingClass && env->IsInstanceOf(e, entityLivingClass));
+        if (env->ExceptionCheck()) { env->ExceptionClear(); isLiving = false; }
+        bool isPlayer = (entityPlayerClass && env->IsInstanceOf(e, entityPlayerClass));
+        if (env->ExceptionCheck()) { env->ExceptionClear(); isPlayer = false; }
+        if (!isLiving || !isPlayer) { env->DeleteLocalRef(e); continue; }
+
+        EspEntityData ed;
+        ed.x = (float)env->GetDoubleField(e, field_posX);
+        ed.y = (float)env->GetDoubleField(e, field_posY);
+        ed.z = (float)env->GetDoubleField(e, field_posZ);
+        ed.isPlayer = true;
+        ed.isRealPlayer = true;
+        ed.isDead = field_isDead ? env->GetBooleanField(e, field_isDead) : false;
+        if (env->ExceptionCheck()) { env->ExceptionClear(); ed.isDead = false; }
+        ed.height = field_height ? env->GetFloatField(e, field_height) : 1.8f;
+        if (env->ExceptionCheck()) { env->ExceptionClear(); ed.height = 1.8f; }
+        if (ed.height < 0.1f || ed.height > 10.0f) ed.height = 1.8f;
+
+        if (method_getHealth) {
+            ed.health = env->CallFloatMethod(e, method_getHealth);
+            if (env->ExceptionCheck()) { env->ExceptionClear(); ed.health = 0.f; }
+        }
+        if (method_getMaxHealth) {
+            ed.maxHealth = env->CallFloatMethod(e, method_getMaxHealth);
+            if (env->ExceptionCheck()) { env->ExceptionClear(); ed.maxHealth = 20.f; }
+        }
+        if (method_getAbsorption) {
+            ed.absorption = env->CallFloatMethod(e, method_getAbsorption);
+            if (env->ExceptionCheck()) { env->ExceptionClear(); ed.absorption = 0.f; }
+        }
+
+        if (method_getName) {
+            jstring jn = (jstring)env->CallObjectMethod(e, method_getName);
+            if (env->ExceptionCheck()) { env->ExceptionClear(); jn = nullptr; }
+            if (jn) {
+                const char* u = env->GetStringUTFChars(jn, nullptr);
+                if (u) ed.name = u;
+                if (u) env->ReleaseStringUTFChars(jn, u);
+                env->DeleteLocalRef(jn);
+            }
+        }
+
+        if (!ed.name.empty()) {
+            std::string lower = ed.name;
+            for (auto& c : lower) c = (char)tolower((unsigned char)c);
+            if (lower.find("npc") != std::string::npos || lower.find("cit-") != std::string::npos) { env->DeleteLocalRef(e); continue; }
+            if (ed.name.size() < 3 || ed.name.size() > 16) { env->DeleteLocalRef(e); continue; }
+            bool validChars = true;
+            for (size_t j = 0; j < ed.name.size() && validChars; j++) {
+                char c = ed.name[j];
+                if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_')) validChars = false;
+            }
+            if (!validChars) { env->DeleteLocalRef(e); continue; }
+        }
+
+        if (!ed.isDead && ed.health > 0) out.push_back(ed);
+        env->DeleteLocalRef(e);
+    }
+
+    if (thePlayer) env->DeleteLocalRef(thePlayer);
+    env->DeleteLocalRef(list);
+}
+
 
 // ===================== NICK DIALOG =====================
 static HBRUSH g_nickDlgBgBrush = nullptr;
@@ -2022,7 +2469,7 @@ static void SampleOneColumn(int bx, int bz, int centerY, bool underground, MapSa
     if (!underground) {
         // Coarse scan: step 4 from y=255 down until we hit something solid
         int approxY = -1;
-        for (int y = 255; y >= 0; y -= 4) {
+        for (int y = 255; y >= 0; y -= 8) {
             uint8_t f;
             int c = Java::GetBlockColorAt(bx, y, bz, f);
             if (c < 0) continue;
@@ -2033,11 +2480,11 @@ static void SampleOneColumn(int bx, int bz, int centerY, bool underground, MapSa
         }
         if (approxY < 0) return;
 
-        // Refine: scan up to +4 above approxY to find the actual top
+        // Refine: scan up to +8 above approxY to find the actual top
         int topY = approxY;
         int topC = -1;
         uint8_t topF = 0;
-        for (int y = approxY + 4; y >= approxY - 3 && y >= 0; y--) {
+        for (int y = approxY + 8; y >= approxY - 4 && y >= 0; y--) {
             uint8_t f;
             int c = Java::GetBlockColorAt(bx, y, bz, f);
             if (c < 0) continue;
@@ -2055,7 +2502,7 @@ static void SampleOneColumn(int bx, int bz, int centerY, bool underground, MapSa
     else {
         int best = -1, bestY = centerY;
         uint8_t bestF = 0;
-        int scanLo = centerY - 8; if (scanLo < 0) scanLo = 0;
+        int scanLo = centerY - 6; if (scanLo < 0) scanLo = 0;
         for (int y = centerY + 1; y >= scanLo; y--) {
             uint8_t f;
             int c = Java::GetBlockColorAt(bx, y, bz, f);
@@ -2163,7 +2610,7 @@ static void UpdateMinimapData() {
     // "inside-out" order: center row, center-1, center+1, center-2, center+2,
     // etc., then wrap to far edges. This makes the nearby terrain appear
     // almost immediately while the outskirts stream in behind it.
-    const int ROWS_PER_TICK = 20;
+    const int ROWS_PER_TICK = 48;
     int half = TERRAIN_DIM / 2;
     for (int rr = 0; rr < ROWS_PER_TICK; rr++) {
         int step = g_stagingRowCursor;
@@ -3044,211 +3491,367 @@ static void RestoreMouseDelayFix() {
     Log("Mouse delay fix: restored");
 }
 
-// ===================== ESP OVERLAY (in-game HP above heads) =====================
-struct EspCamera {
-    float x, y, z;
-    float yaw, pitch;
-    float fovDeg;
-    bool  valid;
-};
-static CRITICAL_SECTION g_espCS;
-static volatile bool g_espCSReady = false;
-static EspCamera g_espCam = {};
-static std::vector<MapEntity> g_espEntities;
-static void InitEspCS() { if (!g_espCSReady) { InitializeCriticalSection(&g_espCS); g_espCSReady = true; } }
+// ===================== OPENGL HOOK FOR ESP =====================
+typedef BOOL(WINAPI* twglSwapBuffers)(HDC hDc);
+twglSwapBuffers oWglSwapBuffers = nullptr;
 
-// Project world (wx,wy,wz) to screen (sx,sy) inside a viewport of viewW x viewH.
-// Uses the exact Minecraft yaw/pitch convention: yaw is applied as (yaw+180)
-// because MC camera looks along -Z at yaw=0 in its own frame but the standard
-// WorldToScreen math expects forward=+Z. FOV uses vertical half-angle against
-// viewport height (matches MC's projection). Returns false if the point is
-// behind the camera or far outside the viewport.
-static const double KARVIS_PI = 3.14159265358979323846;
-static bool ProjectWorldToScreen(const EspCamera& c, float wx, float wy, float wz,
-    int viewW, int viewH, float& sx, float& sy) {
-    double dx = (double)wx - (double)c.x;
-    double dy = (double)wy - (double)c.y;
-    double dz = (double)wz - (double)c.z;
+static const int MAX_STOLEN = 32;
+static int g_stolenBytes = 0;
+static BYTE g_originalBytes[MAX_STOLEN] = {};
+static BYTE* g_trampoline = nullptr;
+static bool g_hookInstalled = false;
+static void* g_pOriginalWglSwapBuffers = nullptr;
 
-    double yawRad = ((double)c.yaw + 180.0) * (KARVIS_PI / 180.0);
-    double pitchRad = (double)c.pitch * (KARVIS_PI / 180.0);
+static int x64_modrm_extra(const BYTE* p) {
+    BYTE modrm = *p; BYTE mod = (modrm >> 6) & 3; BYTE rm = modrm & 7; int extra = 0;
+    if (mod == 3) return 1; bool hasSIB = (rm == 4); extra = 1;
+    if (hasSIB) { extra++; rm = p[1] & 7; }
+    if (mod == 0) { if (rm == 5) extra += 4; }
+    else if (mod == 1) extra += 1; else if (mod == 2) extra += 4;
+    return extra;
+}
 
+static int x64_insn_len(const BYTE* code) {
+    const BYTE* p = code;
+    for (;;) { if (*p == 0x66 || *p == 0x67 || *p == 0xF2 || *p == 0xF3 || *p == 0x2E || *p == 0x3E || *p == 0x26 || *p == 0x36 || *p == 0x64 || *p == 0x65) { p++; continue; } break; }
+    bool rex_w = false; if (*p >= 0x40 && *p <= 0x4F) { rex_w = (*p & 0x08) != 0; p++; }
+    BYTE op = *p++;
+    if (op >= 0x50 && op <= 0x5F) return (int)(p - code); if (op == 0x90) return (int)(p - code);
+    if (op == 0xC3) return (int)(p - code); if (op == 0xCC) return (int)(p - code);
+    if (op == 0xEB) return (int)(p - code) + 1; if (op == 0xE9) return (int)(p - code) + 4; if (op == 0xE8) return (int)(p - code) + 4;
+    if (op >= 0x70 && op <= 0x7F) return (int)(p - code) + 1;
+    if (op >= 0xB8 && op <= 0xBF) return (int)(p - code) + (rex_w ? 8 : 4);
+    if (op >= 0xB0 && op <= 0xB7) return (int)(p - code) + 1;
+    if (op == 0x0F) { BYTE op2 = *p++; if (op2 >= 0x80 && op2 <= 0x8F) return (int)(p - code) + 4; if (op2 == 0x1F) return (int)(p - code) + x64_modrm_extra(p); return 0; }
+    if (op == 0x89 || op == 0x8B || op == 0x8D || op == 0x01 || op == 0x03 || op == 0x85 || op == 0x87 || op == 0x39 || op == 0x3B) return (int)(p - code) + x64_modrm_extra(p);
+    if (op == 0xFF) return (int)(p - code) + x64_modrm_extra(p);
+    if (op == 0x80 || op == 0x83) return (int)(p - code) + x64_modrm_extra(p) + 1;
+    if (op == 0x81) return (int)(p - code) + x64_modrm_extra(p) + 4;
+    if (op == 0xC6) return (int)(p - code) + x64_modrm_extra(p) + 1;
+    if (op == 0xC7) return (int)(p - code) + x64_modrm_extra(p) + 4;
+    if (op == 0xF6) { BYTE reg = (p[0] >> 3) & 7; return (int)(p - code) + x64_modrm_extra(p) + (reg == 0 ? 1 : 0); }
+    if (op == 0xF7) { BYTE reg = (p[0] >> 3) & 7; return (int)(p - code) + x64_modrm_extra(p) + (reg == 0 ? 4 : 0); }
+    if (op == 0xC2) return (int)(p - code) + 2;
+    return 0;
+}
+
+static BYTE* AllocateNear(void* target, size_t size) {
+    uintptr_t tgt = (uintptr_t)target;
+    for (uintptr_t delta = 0x10000; delta < 0x40000000ULL; delta += 0x10000) {
+        if (tgt > delta) { BYTE* p = (BYTE*)VirtualAlloc((void*)(tgt - delta), size, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE); if (p) return p; }
+        BYTE* p = (BYTE*)VirtualAlloc((void*)(tgt + delta), size, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE); if (p) return p;
+    }
+    return (BYTE*)VirtualAlloc(nullptr, size, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+}
+
+static void FixupRipRelative(BYTE* trampoline, BYTE* original, int stolenBytes) {
+    int pos = 0;
+    while (pos < stolenBytes) {
+        int len = x64_insn_len(trampoline + pos); if (len <= 0) break;
+        BYTE* insn = trampoline + pos; BYTE* pp = insn; int pi = 0;
+        while (pi < len && (pp[pi] == 0x66 || pp[pi] == 0x67 || pp[pi] == 0xF2 || pp[pi] == 0xF3)) pi++;
+        if (pi < len && pp[pi] >= 0x40 && pp[pi] <= 0x4F) pi++;
+        if (pi < len && (pp[pi] == 0xE8 || pp[pi] == 0xE9)) {
+            int relIdx = pi + 1; if (relIdx + 4 <= len) {
+                int32_t oldRel; memcpy(&oldRel, insn + relIdx, 4);
+                intptr_t targetAddr = (intptr_t)(original + pos + len) + oldRel;
+                intptr_t newRIP = (intptr_t)(trampoline + pos + len);
+                int64_t newRel64 = targetAddr - newRIP;
+                if (newRel64 >= INT32_MIN && newRel64 <= INT32_MAX) { int32_t newRel = (int32_t)newRel64; memcpy(insn + relIdx, &newRel, 4); }
+            }
+        }
+        pos += len;
+    }
+}
+
+static bool InstallHook(void* target, void* hook, void** original) {
+    const int MIN_HOOK = 12; BYTE* t = (BYTE*)target;
+    if (t[0] == 0xFF && t[1] == 0x25) { int32_t disp = *(int32_t*)(t + 2); void** jmpTarget = (void**)(t + 6 + disp); target = *jmpTarget; t = (BYTE*)target; }
+    else if (t[0] == 0x48 && t[1] == 0xFF && t[2] == 0x25) { int32_t disp = *(int32_t*)(t + 3); void** jmpTarget = (void**)(t + 7 + disp); target = *jmpTarget; t = (BYTE*)target; }
+    else if (t[0] == 0xE9) { int32_t disp = *(int32_t*)(t + 1); void* jmpDest = (void*)(t + 5 + disp); target = jmpDest; t = (BYTE*)target; }
+
+    g_stolenBytes = 0; int pos = 0;
+    while (pos < MIN_HOOK) { int len = x64_insn_len(t + pos); if (len == 0) return false; pos += len; }
+    g_stolenBytes = pos; if (g_stolenBytes > MAX_STOLEN) return false;
+    memcpy(g_originalBytes, t, g_stolenBytes);
+
+    g_trampoline = AllocateNear(target, g_stolenBytes + 16); if (!g_trampoline) return false;
+    memcpy(g_trampoline, t, g_stolenBytes); FixupRipRelative(g_trampoline, t, g_stolenBytes);
+
+    BYTE* trampolineJmp = g_trampoline + g_stolenBytes;
+    uintptr_t returnAddr = (uintptr_t)target + g_stolenBytes;
+    uint32_t lo32 = (uint32_t)(returnAddr & 0xFFFFFFFF); uint32_t hi32 = (uint32_t)(returnAddr >> 32);
+    trampolineJmp[0] = 0x68; memcpy(trampolineJmp + 1, &lo32, 4);
+    trampolineJmp[5] = 0xC7; trampolineJmp[6] = 0x44; trampolineJmp[7] = 0x24; trampolineJmp[8] = 0x04;
+    memcpy(trampolineJmp + 9, &hi32, 4); trampolineJmp[13] = 0xC3;
+
+    *original = (void*)g_trampoline;
+    DWORD oldProtect;
+    if (!VirtualProtect(target, g_stolenBytes, PAGE_EXECUTE_READWRITE, &oldProtect)) return false;
+    BYTE* tb = (BYTE*)target; tb[0] = 0x48; tb[1] = 0xB8; uintptr_t hookAddr = (uintptr_t)hook; memcpy(tb + 2, &hookAddr, 8); tb[10] = 0xFF; tb[11] = 0xE0;
+    for (int i = 12; i < g_stolenBytes; i++) tb[i] = 0x90;
+    VirtualProtect(target, g_stolenBytes, oldProtect, &oldProtect);
+    FlushInstructionCache(GetCurrentProcess(), target, g_stolenBytes);
+
+    g_pOriginalWglSwapBuffers = target; g_hookInstalled = true;
+    return true;
+}
+
+static void RemoveHook(void* target) {
+    if (!g_hookInstalled || !target) return;
+    DWORD oldProtect;
+    if (VirtualProtect(target, g_stolenBytes, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+        memcpy(target, g_originalBytes, g_stolenBytes);
+        VirtualProtect(target, g_stolenBytes, oldProtect, &oldProtect);
+        FlushInstructionCache(GetCurrentProcess(), target, g_stolenBytes);
+    }
+    if (g_trampoline) { VirtualFree(g_trampoline, 0, MEM_RELEASE); g_trampoline = nullptr; }
+    g_hookInstalled = false;
+}
+
+#define GL_FONT_COUNT 18
+static const int GL_FONT_SIZES[GL_FONT_COUNT] = { 12,14,16,18,20,22,24,27,30,34,38,42,48,54,60,68,78,90 };
+static GLuint g_fontLists[GL_FONT_COUNT] = {};
+static GLuint g_fontListsNormal[GL_FONT_COUNT] = {};
+static bool g_fontInit = false;
+
+static int PickFontIndex(int desiredSize) {
+    int bestIdx = 1, bestDiff = 999;
+    for (int i = 0; i < GL_FONT_COUNT; i++) {
+        int d = GL_FONT_SIZES[i] - desiredSize;
+        int penalty = d >= 0 ? (int)(d * 0.85f) : -d;
+        if (penalty < bestDiff) { bestDiff = penalty; bestIdx = i; }
+    }
+    return bestIdx;
+}
+
+static void InitGLFonts(HDC hDc) {
+    if (g_fontInit) return;
+    for (int i = 0; i < GL_FONT_COUNT; i++) {
+        g_fontLists[i] = glGenLists(96);
+        g_fontListsNormal[i] = glGenLists(96);
+        HFONT hFontBold = CreateFontA(GL_FONT_SIZES[i], 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET, OUT_TT_ONLY_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, VARIABLE_PITCH | FF_SWISS, "Segoe UI");
+        HFONT hFontNorm = CreateFontA(GL_FONT_SIZES[i], 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET, OUT_TT_ONLY_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, VARIABLE_PITCH | FF_SWISS, "Segoe UI");
+        HFONT oldFont = (HFONT)SelectObject(hDc, hFontBold);
+        wglUseFontBitmaps(hDc, 32, 96, g_fontLists[i]);
+        SelectObject(hDc, hFontNorm);
+        wglUseFontBitmaps(hDc, 32, 96, g_fontListsNormal[i]);
+        SelectObject(hDc, oldFont);
+        DeleteObject(hFontBold); DeleteObject(hFontNorm);
+    }
+    g_fontInit = true;
+}
+
+static void DrawESPTextSized(float x, float y, const char* text, int r, int g, int b, int fontSize) {
+    if (!g_fontInit) return;
+    int idx = PickFontIndex(fontSize);
+    GLsizei len = (GLsizei)strlen(text);
+    glListBase(g_fontLists[idx] - 32);
+    glColor4ub(0, 0, 0, 230);
+    glRasterPos2f(x - 1, y); glCallLists(len, GL_UNSIGNED_BYTE, text);
+    glRasterPos2f(x + 1, y); glCallLists(len, GL_UNSIGNED_BYTE, text);
+    glRasterPos2f(x, y - 1); glCallLists(len, GL_UNSIGNED_BYTE, text);
+    glRasterPos2f(x, y + 1); glCallLists(len, GL_UNSIGNED_BYTE, text);
+    glColor3ub(r, g, b);
+    glRasterPos2f(x, y);
+    glCallLists(len, GL_UNSIGNED_BYTE, text);
+}
+
+static bool GL_WorldToScreenMat(const Vec3& world, POINT& out, int sw, int sh, const Vec3& rp, const float mv[16], const float proj[16]) {
+    float rx = (float)(world.x - rp.x), ry = (float)(world.y - rp.y), rz = (float)(world.z - rp.z);
+    float ex = mv[0]*rx + mv[4]*ry + mv[8]*rz + mv[12];
+    float ey = mv[1]*rx + mv[5]*ry + mv[9]*rz + mv[13];
+    float ez = mv[2]*rx + mv[6]*ry + mv[10]*rz + mv[14];
+    float ew = mv[3]*rx + mv[7]*ry + mv[11]*rz + mv[15];
+    float cx = proj[0]*ex + proj[4]*ey + proj[8]*ez + proj[12]*ew;
+    float cy = proj[1]*ex + proj[5]*ey + proj[9]*ez + proj[13]*ew;
+    float cw = proj[3]*ex + proj[7]*ey + proj[11]*ez + proj[15]*ew;
+    if (cw <= 0.01f) return false;
+    float ndcX = cx / cw, ndcY = cy / cw;
+    out.x = (LONG)((ndcX + 1.0f) * 0.5f * sw);
+    out.y = (LONG)((1.0f - ndcY) * 0.5f * sh);
+    return (out.x >= -500 && out.x <= sw + 500 && out.y >= -500 && out.y <= sh + 500);
+}
+
+static bool GL_ManualWorldToScreen(const Vec3& world, POINT& out, int sw, int sh, const Vec3& cam, const Rotation& rot, float fov) {
+    double dx = world.x - cam.x, dy = world.y - cam.y, dz = world.z - cam.z;
+    double yawRad = (rot.yaw + 180.0) * (KARVIS_PI / 180.0);
+    double pitchRad = rot.pitch * (KARVIS_PI / 180.0);
     double cosy = cos(yawRad), siny = sin(yawRad);
     double cosp = cos(pitchRad), sinp = sin(pitchRad);
-
     double x2 = dx * cosy + dz * siny;
     double z2 = -dx * siny + dz * cosy;
     double y2 = dy * cosp - z2 * sinp;
     double zz = dy * sinp + z2 * cosp;
-
     if (zz >= -0.1) return false;
     double depth = -zz;
-
-    double fov = c.fovDeg > 1.f ? (double)c.fovDeg : 70.0;
     double fovRad = (fov * 0.5) * (KARVIS_PI / 180.0);
-    double focal = ((double)viewH * 0.5) / tan(fovRad);
-
-    sx = (float)((double)viewW * 0.5 + (x2 * focal / depth));
-    sy = (float)((double)viewH * 0.5 - (y2 * focal / depth));
-
-    return (sx >= -500.f && sx <= viewW + 500.f &&
-        sy >= -500.f && sy <= viewH + 500.f);
+    double focal = (sh * 0.5) / tan(fovRad);
+    out.x = (LONG)(sw * 0.5 + (x2 * focal / depth));
+    out.y = (LONG)(sh * 0.5 - (y2 * focal / depth));
+    return (out.x >= -500 && out.x <= sw + 500 && out.y >= -500 && out.y <= sh + 500);
 }
 
-// Back buffer for the ESP overlay (reused across frames)
-static HDC     g_espMemDC = nullptr;
-static HBITMAP g_espBmp = nullptr;
-static int     g_espBmpW = 0;
-static int     g_espBmpH = 0;
+static void DrawESPEntities(int w, int h) {
+    std::vector<EspEntityData> ents; EspCameraData cam;
+    EnterCriticalSection(&g_espCS);
+    ents = g_espEntities; cam = g_espCam;
+    LeaveCriticalSection(&g_espCS);
+    if (ents.empty() || !cam.valid) return;
 
-static void RenderEspTo(HDC hdc, int w, int h) {
-    if (w <= 0 || h <= 0) return;
-    if (!g_espMemDC || g_espBmpW != w || g_espBmpH != h) {
-        if (g_espBmp) { DeleteObject(g_espBmp);   g_espBmp = nullptr; }
-        if (g_espMemDC) { DeleteDC(g_espMemDC);     g_espMemDC = nullptr; }
-        g_espMemDC = CreateCompatibleDC(hdc);
-        g_espBmp = CreateCompatibleBitmap(hdc, w, h);
-        SelectObject(g_espMemDC, g_espBmp);
-        g_espBmpW = w;
-        g_espBmpH = h;
-    }
-    HDC dc = g_espMemDC;
+    for (const auto& e : ents) {
+        Vec3 feet = { e.x, e.y - 0.05f, e.z };
+        Vec3 head = feet; head.y += e.height + 0.2f;
 
-    // Fill with color-key magenta (fully transparent)
-    HBRUSH clr = CreateSolidBrush(RGB(255, 0, 255));
-    RECT r = { 0, 0, w, h };
-    FillRect(dc, &r, clr);
-    DeleteObject(clr);
+        POINT sFeet, sHead;
+        bool feetOK = false, headOK = false;
 
-    EspCamera cam = {};
-    std::vector<MapEntity> ents;
-    if (g_espCSReady) {
-        EnterCriticalSection(&g_espCS);
-        cam = g_espCam;
-        ents = g_espEntities;
-        LeaveCriticalSection(&g_espCS);
-    }
-
-    if (cam.valid) {
-        for (const auto& e : ents) {
-            if (e.isSelf) continue;
-            if (e.kind == 1 && !e.isRealPlayer) continue;
-            if (e.isNpc) continue;
-            if (e.maxHealth <= 0.f) continue;
-
-            // Anchor above the head: posY is the feet. Player model ~1.8 tall,
-            // add a small margin for the hearts to sit above the nametag.
-            float sx, sy;
-            if (!ProjectWorldToScreen(cam, e.x, e.y + 2.4f, e.z, w, h, sx, sy)) continue;
-            if (sx < -64.f || sx > w + 64.f || sy < -32.f || sy > h + 32.f) continue;
-
-            int redHearts = (int)ceilf(e.health / 2.0f);
-            int goldHearts = (int)ceilf(e.absorption / 2.0f);
-            int cx = (int)sx;
-            int baseY = (int)sy;
-            DrawHeartStack(dc, cx, baseY, redHearts, goldHearts);
+        if (cam.matricesValid) {
+            feetOK = GL_WorldToScreenMat(feet, sFeet, w, h, cam.renderPos, cam.mvMatrix, cam.projMatrix);
+            headOK = GL_WorldToScreenMat(head, sHead, w, h, cam.renderPos, cam.mvMatrix, cam.projMatrix);
         }
-    }
+        if (!feetOK) feetOK = GL_ManualWorldToScreen(feet, sFeet, w, h, cam.camPos, cam.camRot, cam.camFov);
+        if (!headOK) headOK = GL_ManualWorldToScreen(head, sHead, w, h, cam.camPos, cam.camRot, cam.camFov);
 
-    BitBlt(hdc, 0, 0, w, h, dc, 0, 0, SRCCOPY);
-}
+        if (!headOK) continue;
 
-LRESULT CALLBACK EspWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    switch (msg) {
-    case WM_CREATE:
-        SetTimer(hWnd, 7, 33, nullptr);
-        return 0;
-    case WM_TIMER:
-        InvalidateRect(hWnd, nullptr, FALSE);
-        return 0;
-    case WM_ERASEBKGND:
-        return TRUE;
-    case WM_PAINT: {
-        PAINTSTRUCT ps;
-        HDC hdc = BeginPaint(hWnd, &ps);
-        RECT cr; GetClientRect(hWnd, &cr);
-        __try { RenderEspTo(hdc, cr.right, cr.bottom); }
-        __except (EXCEPTION_EXECUTE_HANDLER) {}
-        EndPaint(hWnd, &ps);
-        return 0;
-    }
-    case WM_MOUSEACTIVATE:
-        return MA_NOACTIVATE;
-    case WM_DESTROY:
-        KillTimer(hWnd, 7);
-        if (g_espBmp) { DeleteObject(g_espBmp);   g_espBmp = nullptr; }
-        if (g_espMemDC) { DeleteDC(g_espMemDC);     g_espMemDC = nullptr; }
-        g_espBmpW = g_espBmpH = 0;
-        return 0;
-    }
-    return DefWindowProc(hWnd, msg, wParam, lParam);
-}
+        int boxH = feetOK ? (sFeet.y - sHead.y) : 30;
+        if (boxH < 6) boxH = 6;
+        if (boxH > h * 3) boxH = (int)(h * 0.5f);
+        int boxW = (int)(boxH * 0.55f);
+        if (boxW < 8) boxW = 8;
+        int centerX = feetOK ? (sFeet.x + sHead.x) / 2 : sHead.x;
+        int by = sHead.y;
+        int bx = centerX - boxW / 2;
 
-static void PositionEspWindow() {
-    if (!g_espWnd) return;
-    HWND game = FindGameWindow();
-    if (!game) { ShowWindow(g_espWnd, SW_HIDE); return; }
-    RECT gr;
-    if (!GetClientRect(game, &gr)) return;
-    POINT tl = { gr.left, gr.top };
-    ClientToScreen(game, &tl);
-    int w = gr.right - gr.left;
-    int h = gr.bottom - gr.top;
-    if (w <= 0 || h <= 0) return;
-    SetWindowPos(g_espWnd, HWND_TOPMOST, tl.x, tl.y, w, h,
-        SWP_NOACTIVATE | SWP_SHOWWINDOW);
-}
+        glLineWidth(2.0f);
+        glBegin(GL_LINE_LOOP);
+        glColor3ub(0, 180, 255);
+        glVertex2f((float)bx, (float)by);
+        glVertex2f((float)(bx + boxW), (float)by);
+        glVertex2f((float)(bx + boxW), (float)(by + boxH));
+        glVertex2f((float)bx, (float)(by + boxH));
+        glEnd();
 
-DWORD WINAPI EspWindowThread(LPVOID param) {
-    HINSTANCE hInst = (HINSTANCE)param;
-    static bool reg = false;
-    if (!reg) {
-        WNDCLASSEXA wc = {};
-        wc.cbSize = sizeof(wc);
-        wc.lpfnWndProc = EspWndProc;
-        wc.hInstance = hInst;
-        wc.hbrBackground = CreateSolidBrush(RGB(255, 0, 255));
-        wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
-        wc.lpszClassName = "KarvisEsp";
-        RegisterClassExA(&wc);
-        reg = true;
-    }
-    g_espWnd = CreateWindowExA(
-        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE,
-        "KarvisEsp", "KarvisEsp", WS_POPUP,
-        0, 0, 100, 100, nullptr, nullptr, hInst, nullptr);
-    if (!g_espWnd) { Log("ESP: CreateWindow failed"); return 1; }
-    SetLayeredWindowAttributes(g_espWnd, RGB(255, 0, 255), 255, LWA_COLORKEY);
+        glLineWidth(3.0f);
+        glBegin(GL_LINE_LOOP);
+        glColor4ub(0, 0, 0, 180);
+        glVertex2f((float)(bx - 1), (float)(by - 1));
+        glVertex2f((float)(bx + boxW + 1), (float)(by - 1));
+        glVertex2f((float)(bx + boxW + 1), (float)(by + boxH + 1));
+        glVertex2f((float)(bx - 1), (float)(by + boxH + 1));
+        glEnd();
+        glLineWidth(1.5f);
+        glBegin(GL_LINE_LOOP);
+        glColor3ub(0, 180, 255);
+        glVertex2f((float)bx, (float)by);
+        glVertex2f((float)(bx + boxW), (float)by);
+        glVertex2f((float)(bx + boxW), (float)(by + boxH));
+        glVertex2f((float)bx, (float)(by + boxH));
+        glEnd();
 
-    MSG msg;
-    g_espRunning = true;
-    ULONGLONG lastReposition = 0;
-    while (g_espRunning) {
-        while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
-            if (msg.message == WM_QUIT) { g_espRunning = false; break; }
-            TranslateMessage(&msg);
-            DispatchMessage(&msg);
-        }
-        ULONGLONG now = GetTickCount64();
-        if (now - lastReposition > 150) {
-            lastReposition = now;
-            HWND game = FindGameWindow();
-            HWND fg = GetForegroundWindow();
-            bool mcAlive = game && IsWindow(game);
-            bool mcShown = mcAlive && IsWindowVisible(game) && !IsIconic(game);
-            bool mcForeground = mcAlive && (fg == game);
-            bool shouldShow = g_settings.espShowHP && g_inGame && mcShown && mcForeground;
-            if (shouldShow) {
-                if (!IsWindowVisible(g_espWnd)) ShowWindow(g_espWnd, SW_SHOWNOACTIVATE);
-                PositionEspWindow();
+        {
+            float hf = e.maxHealth > 0.0f ? e.health / e.maxHealth : 0.0f;
+            bool hasAbsorption = e.health > e.maxHealth;
+            float absPct = 0.0f;
+            if (hasAbsorption) {
+                absPct = std::min(1.0f, (e.health - e.maxHealth) / e.maxHealth);
+                hf = 1.0f;
             }
-            else {
-                if (IsWindowVisible(g_espWnd)) ShowWindow(g_espWnd, SW_HIDE);
+            hf = std::max(0.0f, std::min(1.0f, hf));
+
+            int barX = bx - 6;
+            int fillH = (int)((boxH - 2) * hf);
+            int absFillH = hasAbsorption ? (int)((boxH - 2) * absPct) : 0;
+
+            glBegin(GL_QUADS); glColor4ub(0, 0, 0, 255);
+            glVertex2f((float)barX, (float)by); glVertex2f((float)(barX + 4), (float)by);
+            glVertex2f((float)(barX + 4), (float)(by + boxH)); glVertex2f((float)barX, (float)(by + boxH));
+            glEnd();
+
+            int gr = hf > 0.7f ? 0 : (hf > 0.3f ? 255 : 255);
+            int gg = hf > 0.7f ? 220 : (hf > 0.3f ? 255 : 50);
+            int gb = hf > 0.7f ? 90 : (hf > 0.3f ? 0 : 0);
+            if (fillH > 0) {
+                glBegin(GL_QUADS); glColor3ub(gr, gg, gb);
+                int fillY = by + boxH - 1 - fillH;
+                glVertex2f((float)(barX + 1), (float)fillY); glVertex2f((float)(barX + 3), (float)fillY);
+                glVertex2f((float)(barX + 3), (float)(by + boxH - 1)); glVertex2f((float)(barX + 1), (float)(by + boxH - 1));
+                glEnd();
+            }
+
+            if (absFillH > 0) {
+                int absStartY = by + boxH - 1 - fillH - absFillH;
+                glBegin(GL_QUADS); glColor3ub(255, 255, 50);
+                glVertex2f((float)(barX + 1), (float)absStartY); glVertex2f((float)(barX + 3), (float)absStartY);
+                glVertex2f((float)(barX + 3), (float)(by + boxH - 1 - fillH)); glVertex2f((float)(barX + 1), (float)(by + boxH - 1 - fillH));
+                glEnd();
             }
         }
-        Sleep(16);
+
+        if (!e.name.empty()) {
+            int baseFont = std::max(14, std::min(20, h / 55));
+            int nameFontSize = std::max(baseFont, std::min(64, (int)(boxH / 7.0f)));
+
+            char hpBuf[32];
+            bool hasAbs = e.health > e.maxHealth;
+            if (hasAbs) snprintf(hpBuf, sizeof(hpBuf), "  %.0f+%.0f", e.maxHealth, e.health - e.maxHealth);
+            else snprintf(hpBuf, sizeof(hpBuf), "  %.0f", e.health);
+
+            float nameW = (float)e.name.size() * nameFontSize * 0.56f;
+            float hpW = (float)strlen(hpBuf) * nameFontSize * 0.56f;
+            float totalW = nameW + hpW;
+            int nx = centerX - (int)(totalW * 0.5f);
+            int ny = by - nameFontSize - 6;
+
+            float ty = (float)ny + (float)nameFontSize;
+            DrawESPTextSized((float)nx, ty, e.name.c_str(), 255, 255, 255, nameFontSize);
+
+            float hpFrac = e.maxHealth > 0 ? e.health / e.maxHealth : 0;
+            int hR, hG, hB;
+            if (hasAbs) { hR = 255; hG = 220; hB = 50; }
+            else if (hpFrac > .7f) { hR = 85; hG = 255; hB = 100; }
+            else if (hpFrac > .3f) { hR = 255; hG = 210; hB = 60; }
+            else { hR = 255; hG = 70; hB = 70; }
+            DrawESPTextSized((float)nx + nameW, ty, hpBuf, hR, hG, hB, nameFontSize);
+        }
     }
-    if (g_espWnd) { DestroyWindow(g_espWnd); g_espWnd = nullptr; }
+}
+
+static void hk_wglSwapBuffers_inner(HDC hDc) {
+    InitGLFonts(hDc);
+    if (g_settings.espShowHP && g_espCSReady && g_inGame) {
+        glPushAttrib(GL_ALL_ATTRIB_BITS);
+        glMatrixMode(GL_PROJECTION); glPushMatrix();
+        glMatrixMode(GL_MODELVIEW); glPushMatrix();
+        GLint viewport[4]; glGetIntegerv(GL_VIEWPORT, viewport);
+        int w = viewport[2], h = viewport[3];
+        glMatrixMode(GL_PROJECTION); glLoadIdentity(); glOrtho(0, w, h, 0, -1, 1);
+        glMatrixMode(GL_MODELVIEW); glLoadIdentity();
+        glDisable(GL_DEPTH_TEST); glDisable(GL_LIGHTING); glDisable(GL_TEXTURE_2D);
+        glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        DrawESPEntities(w, h);
+        glMatrixMode(GL_PROJECTION); glPopMatrix();
+        glMatrixMode(GL_MODELVIEW); glPopMatrix();
+        glPopAttrib();
+    }
+}
+
+BOOL WINAPI hk_wglSwapBuffers(HDC hDc) {
+    __try { hk_wglSwapBuffers_inner(hDc); }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
+    return oWglSwapBuffers(hDc);
+}
+
+DWORD WINAPI SetupHookThread(LPVOID lpReserved) {
+    Sleep(3000); HMODULE hMod = nullptr;
+    for (int i = 0; i < 30; i++) { Sleep(1000); hMod = GetModuleHandleA("opengl32.dll"); if (hMod) break; }
+    if (!hMod) return 1;
+    void* pFunc = (void*)GetProcAddress(hMod, "wglSwapBuffers"); if (!pFunc) return 1;
+    InstallHook(pFunc, &hk_wglSwapBuffers, (void**)&oWglSwapBuffers);
+    Log("GL hook: %s", g_hookInstalled ? "OK" : "FAILED");
     return 0;
 }
 
@@ -3306,54 +3909,60 @@ DWORD WINAPI JniWorkerThread(LPVOID param) {
             lastPF = now;
         }
 
-        // Minimap + ESP: both need pose/entities. Pose is updated any time
-        // either overlay is active, ESP additionally needs pitch.
-        bool needPose = g_settings.mapEnabled || g_settings.espShowHP;
-        bool needEntities = g_settings.mapEnabled || g_settings.espShowHP;
+        // === ESP Camera + Entities ===
+        bool needEsp = g_settings.espShowHP;
+        bool needMap = g_settings.mapEnabled;
 
-        if (needPose && now - lastMapPose >= 50) {
-            float px, py, pz, yaw, pitch;
-            if (Java::GetPlayerPoseEx(px, py, pz, yaw, pitch)) {
+        // Camera data for ESP (high frequency for smooth tracking)
+        if (needEsp && now - lastMapPose >= 8) {
+            __try { Java::UpdateCameraData(); }
+            __except (EXCEPTION_EXECUTE_HANDLER) {}
+            lastMapPose = now;
+        }
+        // Map pose (lower frequency)
+        else if (needMap && !needEsp && now - lastMapPose >= 50) {
+            float px, py, pz, yaw;
+            if (Java::GetPlayerPose(px, py, pz, yaw)) {
                 if (g_mapCSReady) {
                     EnterCriticalSection(&g_mapCS);
                     g_map.playerX = px; g_map.playerY = py; g_map.playerZ = pz; g_map.playerYaw = yaw;
                     LeaveCriticalSection(&g_mapCS);
                 }
-                if (g_espCSReady) {
-                    EnterCriticalSection(&g_espCS);
-                    // Eye height for the player is 1.62 blocks above posY.
-                    g_espCam.x = px;
-                    g_espCam.y = py + 1.62f;
-                    g_espCam.z = pz;
-                    g_espCam.yaw = yaw;
-                    g_espCam.pitch = pitch;
-                    g_espCam.fovDeg = 70.f; // default; could read from GameSettings
-                    g_espCam.valid = true;
-                    LeaveCriticalSection(&g_espCS);
-                }
             }
             lastMapPose = now;
         }
 
-        if (needEntities && now - lastEntities >= 200) {
+        // Entity collection (shared between map + ESP)
+        bool needEntities = needMap || needEsp;
+        if (needEntities && now - lastEntities >= 100) {
             float px = g_map.playerX, pz = g_map.playerZ;
-            std::vector<MapEntity> ents;
-            SafeEnumerateEntitiesRaw(&ents, px, pz);
+            std::vector<MapEntity> mapEnts;
+            SafeEnumerateEntitiesRaw(&mapEnts, px, pz);
+
             if (g_mapCSReady) {
                 EnterCriticalSection(&g_mapCS);
-                g_map.entities = ents;
+                g_map.entities = mapEnts;
                 LeaveCriticalSection(&g_mapCS);
             }
-            if (g_espCSReady) {
-                EnterCriticalSection(&g_espCS);
-                g_espEntities = std::move(ents);
-                LeaveCriticalSection(&g_espCS);
+
+            // ESP entities (separate collection for HP data)
+            if (needEsp) {
+                __try {
+                    std::vector<EspEntityData> espEnts;
+                    Java::CollectEspEntities(espEnts);
+                    if (g_espCSReady) {
+                        EnterCriticalSection(&g_espCS);
+                        g_espEntities = std::move(espEnts);
+                        LeaveCriticalSection(&g_espCS);
+                    }
+                }
+                __except (EXCEPTION_EXECUTE_HANDLER) {}
             }
             lastEntities = now;
         }
 
-        // Terrain sampling is only needed for the minimap.
-        if (g_settings.mapEnabled && now - lastMapFull >= 80) {
+        // Terrain sampling for minimap
+        if (needMap && now - lastMapFull >= 80) {
             SafeUpdateMinimapData();
             lastMapFull = now;
         }
@@ -3393,10 +4002,6 @@ void MainThread(HMODULE hModule) {
 
     // Map window thread (owns its own window/message loop)
     g_mapThreadHandle = CreateThread(nullptr, 0, MapWindowThread, hModule, 0, &g_mapThreadId);
-
-    // ESP window thread (in-game HP hearts above heads)
-    InitEspCS();
-    g_espThreadHandle = CreateThread(nullptr, 0, EspWindowThread, hModule, 0, &g_espThreadId);
 
     g_jniRunning = false;
     g_jniThread = CreateThread(nullptr, 0, JniWorkerThread, hModule, 0, nullptr);
@@ -3458,15 +4063,7 @@ void MainThread(HMODULE hModule) {
     // Restore mouse settings before tearing anything else down.
     if (g_mouseFixApplied) RestoreMouseDelayFix();
 
-    // Shut down ESP thread
-    g_espRunning = false;
-    if (g_espThreadId) PostThreadMessage(g_espThreadId, WM_QUIT, 0, 0);
-    if (g_espThreadHandle) {
-        WaitForSingleObject(g_espThreadHandle, 3000);
-        CloseHandle(g_espThreadHandle);
-        g_espThreadHandle = nullptr;
-    }
-    g_espThreadId = 0;
+    if (g_pOriginalWglSwapBuffers) RemoveHook(g_pOriginalWglSwapBuffers);
 
     // Shut down map thread
     g_mapRunning = false;
@@ -3510,13 +4107,16 @@ void MainThread(HMODULE hModule) {
 }
 
 // ===================== DLL ENTRY =====================
+#pragma comment(linker, "/guard:no")
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {
     switch (ul_reason_for_call) {
     case DLL_PROCESS_ATTACH:
         DisableThreadLibraryCalls(hModule);
+        CreateThread(nullptr, 0, SetupHookThread, hModule, 0, nullptr);
         CreateThread(nullptr, 0, (LPTHREAD_START_ROUTINE)MainThread, hModule, 0, nullptr);
         break;
     case DLL_PROCESS_DETACH:
+        if (g_pOriginalWglSwapBuffers) RemoveHook(g_pOriginalWglSwapBuffers);
         break;
     }
     return TRUE;
