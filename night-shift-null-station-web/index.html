@@ -1,0 +1,221 @@
+<!doctype html>
+<html lang="cs">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+  <meta name="theme-color" content="#050809">
+  <meta name="description" content="Night Shift: Null Station — originální 3D survival horor přímo v prohlížeči.">
+  <title>Night Shift: Null Station</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main id="game" aria-label="3D herní scéna"></main>
+
+  <div id="postFx" aria-hidden="true">
+    <div class="vignette"></div>
+    <div class="grain"></div>
+    <div class="flicker"></div>
+    <div class="chromatic"></div>
+  </div>
+
+  <header id="hud" class="game-ui hidden-ui">
+    <div class="hud-stack">
+      <div class="clock-row">
+        <strong id="clock">12 AM</strong>
+        <span id="nightLabel">NOC 1</span>
+      </div>
+      <div class="status-row">
+        <span class="status-dot"></span>
+        <span id="systemStatus">SYSTÉMY ONLINE</span>
+      </div>
+    </div>
+
+    <div class="hud-stack hud-right">
+      <div class="power-row">
+        <strong id="power">100%</strong>
+        <span>ENERGIE</span>
+      </div>
+      <div id="usage" aria-label="Aktuální spotřeba energie">
+        <span>SPOTŘEBA</span>
+        <div class="usage-bars"><i></i><i></i><i></i><i></i><i></i><i></i></div>
+      </div>
+    </div>
+  </header>
+
+  <aside id="threatPanel" class="game-ui hidden-ui" aria-live="polite">
+    <span>DIAGNOSTIKA</span>
+    <strong id="threatText">BEZ POHYBU</strong>
+    <div class="threat-meter"><i id="threatFill"></i></div>
+  </aside>
+
+  <section id="officeControls" class="game-ui hidden-ui" aria-label="Ovládání kanceláře">
+    <div class="control-stack control-left">
+      <button id="leftDoor" class="control-button door" type="button">
+        <span class="control-led"></span><b>LEVÉ DVEŘE</b><small>[Z]</small>
+      </button>
+      <button id="leftLight" class="control-button light" type="button">
+        <span class="control-led"></span><b>LEVÉ SVĚTLO</b><small>[X]</small>
+      </button>
+    </div>
+
+    <div class="control-stack control-right">
+      <button id="rightDoor" class="control-button door" type="button">
+        <span class="control-led"></span><b>PRAVÉ DVEŘE</b><small>[N]</small>
+      </button>
+      <button id="rightLight" class="control-button light" type="button">
+        <span class="control-led"></span><b>PRAVÉ SVĚTLO</b><small>[M]</small>
+      </button>
+    </div>
+
+    <button id="ventSeal" class="vent-button" type="button">
+      <span class="control-led"></span><b>UZÁVĚR VENTILACE</b><small>[V]</small>
+    </button>
+
+    <button id="monitorButton" class="monitor-button" type="button">
+      <span class="monitor-icon" aria-hidden="true"></span>
+      <b>BEZPEČNOSTNÍ KAMERY</b><small>[C]</small>
+    </button>
+
+    <button id="lookLeft" class="look-button look-left" type="button" aria-label="Podívat doleva">‹</button>
+    <button id="lookRight" class="look-button look-right" type="button" aria-label="Podívat doprava">›</button>
+  </section>
+
+  <section id="monitor" class="hidden" aria-label="Bezpečnostní kamerový systém">
+    <div class="monitor-frame"></div>
+    <div class="scanlines"></div>
+    <div id="cameraNoise" class="camera-noise"></div>
+    <div id="signalLoss" class="signal-loss hidden">
+      <strong>SIGNÁL PŘERUŠEN</strong>
+      <span>OBNOVUJI SPOJENÍ…</span>
+    </div>
+
+    <div class="monitor-top">
+      <div>
+        <strong id="cameraName">CAM 01 — ATRIUM</strong>
+        <span id="cameraMeta">SIGNÁL 96% · AUDIO PASIVNÍ</span>
+      </div>
+      <div class="recording"><i></i> REC <span id="recordTimer">00:00:00</span></div>
+    </div>
+
+    <div id="motionWarning" class="motion-warning hidden">⚠ POHYB DETEKOVÁN</div>
+
+    <aside id="cameraMap">
+      <div class="map-title"><span>NULL STATION / B1</span><b>MAPA SÍTĚ</b></div>
+      <div class="map-grid">
+        <button data-cam="0" style="--x:43%;--y:12%">01</button>
+        <button data-cam="1" style="--x:15%;--y:28%">02</button>
+        <button data-cam="2" style="--x:71%;--y:28%">03</button>
+        <button data-cam="3" style="--x:15%;--y:58%">04</button>
+        <button data-cam="4" style="--x:71%;--y:58%">05</button>
+        <button data-cam="5" style="--x:43%;--y:43%">06</button>
+        <button data-cam="6" style="--x:43%;--y:71%">07</button>
+        <button data-cam="7" style="--x:43%;--y:89%">08</button>
+        <div class="office-node">TY</div>
+        <svg viewBox="0 0 100 100" aria-hidden="true">
+          <path d="M48 17H20V34M52 17H80V34M20 34V64H34M80 34V64H66M34 47H66M50 47V92"/>
+        </svg>
+      </div>
+      <div class="map-legend"><span><i></i> AKTIVNÍ</span><span><i></i> POHYB</span></div>
+    </aside>
+
+    <button id="closeMonitor" class="close-monitor" type="button">SKLOPIT MONITOR <kbd>C</kbd></button>
+  </section>
+
+  <section id="startScreen" class="overlay visible">
+    <div class="start-ambient" aria-hidden="true"><i></i><i></i><i></i></div>
+    <div class="panel start-panel">
+      <div class="eyebrow"><span></span> ORIGINÁLNÍ 3D SURVIVAL HOROR</div>
+      <h1>NIGHT SHIFT:<br><em>NULL STATION</em></h1>
+      <p class="lead">Podzemní servisní stanice zůstala po evakuaci aktivní. Tři autonomní jednotky ignorují příkaz k odstavení. Udrž kancelář zabezpečenou až do 6:00.</p>
+
+      <div class="setup-grid">
+        <label class="select-card">
+          <span>OBTÍŽNOST</span>
+          <select id="difficulty">
+            <option value="training">VÝCVIK — pomalejší hrozby</option>
+            <option value="standard" selected>STANDARD — doporučeno</option>
+            <option value="nightmare">NOČNÍ MŮRA — agresivní AI</option>
+          </select>
+        </label>
+        <label class="select-card">
+          <span>KVALITA</span>
+          <select id="quality">
+            <option value="auto" selected>AUTOMATICKÁ</option>
+            <option value="high">VYSOKÁ</option>
+            <option value="low">ÚSPORNÁ</option>
+          </select>
+        </label>
+      </div>
+
+      <div class="briefing">
+        <div><b>01</b><span>Kamery odhalí pohyb, ale zvyšují spotřebu.</span></div>
+        <div><b>02</b><span>Dveře zavírej pouze při bezprostřední hrozbě.</span></div>
+        <div><b>03</b><span>Ventilační jednotku zastaví jen středový uzávěr.</span></div>
+      </div>
+
+      <div class="instructions">
+        <span><kbd>MYŠ</kbd> / <kbd>A D</kbd> ROZHLÍŽENÍ</span>
+        <span><kbd>C</kbd> KAMERY</span>
+        <span><kbd>1–8</kbd> VOLBA KAMERY</span>
+        <span><kbd>P</kbd> PAUZA</span>
+      </div>
+
+      <button id="startButton" class="primary-button" type="button"><span>ZAHÁJIT SMĚNU</span><i>→</i></button>
+      <p class="legal-note">Všechny postavy, prostředí, názvy, grafika a zvuky jsou původní.</p>
+    </div>
+  </section>
+
+  <section id="loadingScreen" class="overlay">
+    <div class="loader-panel">
+      <div class="loader-ring"></div>
+      <strong>INICIALIZUJI STANICI</strong>
+      <span id="loadingText">Kalibrace bezpečnostních kamer…</span>
+    </div>
+  </section>
+
+  <section id="pauseScreen" class="overlay">
+    <div class="panel pause-panel">
+      <div class="eyebrow"><span></span> SMĚNA POZASTAVENA</div>
+      <h2>PAUZA</h2>
+      <p>Čas i nepřátelské jednotky jsou zastavené.</p>
+      <button id="resumeButton" class="primary-button" type="button"><span>POKRAČOVAT</span><i>→</i></button>
+    </div>
+  </section>
+
+  <section id="endScreen" class="overlay">
+    <div class="panel end-panel">
+      <div class="eyebrow"><span></span> <b id="endEyebrow">SMĚNA UKONČENA</b></div>
+      <h2 id="endTitle">6:00</h2>
+      <p id="endText">Přežil jsi noc.</p>
+      <div id="endStats" class="end-stats"></div>
+      <button id="restartButton" class="primary-button" type="button"><span>HRÁT ZNOVU</span><i>↻</i></button>
+    </div>
+  </section>
+
+  <div id="jumpscare" class="hidden" aria-hidden="true">
+    <div class="scare-static"></div>
+    <div class="scare-head">
+      <div class="head-shell"></div>
+      <div class="scare-eye eye-left"><i></i></div>
+      <div class="scare-eye eye-right"><i></i></div>
+      <div class="scare-mouth"><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+      <div class="scare-wire w1"></div><div class="scare-wire w2"></div><div class="scare-wire w3"></div>
+    </div>
+  </div>
+
+  <div id="toast" role="status" aria-live="polite"></div>
+  <div id="fatalError" class="fatal-error hidden">
+    <strong>HRU SE NEPODAŘILO SPUSTIT</strong>
+    <p>Prohlížeč nepodporuje WebGL nebo se nepodařilo načíst 3D knihovnu. Zkus aktuální Chrome, Edge nebo Firefox.</p>
+  </div>
+
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.165.0/build/three.module.js"
+    }
+  }
+  </script>
+  <script type="module" src="game.js"></script>
+</body>
+</html>
